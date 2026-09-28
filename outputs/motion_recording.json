@@ -1,0 +1,69 @@
+{
+  "duration": 6.0,
+  "sample_rate": 48000,
+  "listener_forward": [
+    0.0,
+    1.0,
+    0.0
+  ],
+  "listener_trajectory": null,
+  "emitters": [
+    {
+      "name": "moving_tone",
+      "kind": "tone",
+      "params": {
+        "frequency": 440.0,
+        "duration": 6.0,
+        "fade": 0.01
+      },
+      "trajectory": [
+        [
+          0.0,
+          -12.0,
+          6.0,
+          0.0
+        ],
+        [
+          3.0,
+          0.0,
+          2.0,
+          0.0
+        ],
+        [
+          6.0,
+          12.0,
+          6.0,
+          0.0
+        ]
+      ],
+      "volume": 1.0,
+      "loop": false,
+      "events": []
+    },
+    {
+      "name": "right_beep",
+      "kind": "tone",
+      "params": {
+        "frequency": 660.0,
+        "duration": 6.0,
+        "fade": 0.01
+      },
+      "trajectory": [
+        [
+          0.0,
+          3.0,
+          2.0,
+          0.0
+        ]
+      ],
+      "volume": 1.0,
+      "loop": false,
+      "events": [
+        [
+          2.0,
+          false
+        ]
+      ]
+    }
+  ]
+}
