@@ -1,0 +1,39 @@
+{
+  "wav": {
+    "path": "/做题/题目/20260929-rerun150/018-空间声音引擎/B/attempts/005/workspace/outputs/moving_source.wav",
+    "samples": 336000,
+    "duration_s": 7.0,
+    "peak_float": 0.4198252281140195,
+    "scale": 1.0
+  },
+  "scenario_sha256": "27e932679cb3cc895f2aada20f33204e56de7cbe345b4f4b5a285b63110034a0",
+  "channel_check": {
+    "early_dominant": "left",
+    "late_dominant": "right",
+    "early_rms": [
+      0.1986,
+      0.1031
+    ],
+    "late_rms": [
+      0.05621,
+      0.09899
+    ]
+  },
+  "chunk_size_invariance_max_abs_diff": 0.0,
+  "saved_scenario_replay_max_abs_diff": 0.0,
+  "deactivation_max_sample_step": 0.03744917720465325,
+  "post_tail_rms": 0.12854039693096886,
+  "report": {
+    "peak_pre_limiter": 0.4474798376201013,
+    "over_level_events": 0,
+    "stopped_sources": [
+      "beeper"
+    ],
+    "notes": [
+      "source 'beeper' deactivated at t=2.496s; fade-out started"
+    ]
+  },
+  "replay_stopped_sources": [
+    "beeper"
+  ]
+}

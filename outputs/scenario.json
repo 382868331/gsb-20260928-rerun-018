@@ -1,0 +1,73 @@
+{
+  "duration": 7.0,
+  "sample_rate": 48000,
+  "listener": {
+    "position": [
+      0,
+      0,
+      0
+    ],
+    "forward": [
+      0.0,
+      1.0,
+      0.0
+    ],
+    "up": [
+      0.0,
+      0.0,
+      1.0
+    ]
+  },
+  "sources": [
+    {
+      "name": "moving_tone",
+      "gain": 1.0,
+      "active": true,
+      "deactivate_at": null,
+      "tone": {
+        "frequency": 440.0,
+        "amplitude": 0.6,
+        "vibrato_hz": 0.0,
+        "vibrato_depth": 0.0
+      },
+      "keyframes": [
+        [
+          0.0,
+          -6.0,
+          4.0,
+          0.0
+        ],
+        [
+          6.0,
+          6.0,
+          4.0,
+          0.0
+        ]
+      ],
+      "position": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "beeper",
+      "gain": 1.0,
+      "active": true,
+      "deactivate_at": 2.5,
+      "tone": {
+        "frequency": 660.0,
+        "amplitude": 0.5,
+        "vibrato_hz": 0.0,
+        "vibrato_depth": 0.0
+      },
+      "keyframes": null,
+      "position": [
+        -2.0,
+        0.5,
+        0.0
+      ]
+    }
+  ],
+  "sha256": "27e932679cb3cc895f2aada20f33204e56de7cbe345b4f4b5a285b63110034a0"
+}
