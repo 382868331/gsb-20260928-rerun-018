@@ -1,0 +1,153 @@
+{
+  "duration": 6.0,
+  "sample_rate": 48000,
+  "listener_forward": [
+    1.0,
+    0.0,
+    0.0
+  ],
+  "listener_trajectory": [
+    [
+      0.0,
+      -3.0,
+      0.0,
+      0.0
+    ],
+    [
+      6.0,
+      -1.0,
+      1.0,
+      0.0
+    ]
+  ],
+  "scene": {
+    "rooms": [
+      {
+        "name": "hall",
+        "min": [
+          -6.0,
+          -4.0,
+          -2.0
+        ],
+        "max": [
+          0.0,
+          4.0,
+          2.0
+        ],
+        "reverb_time": 0.7,
+        "reverb_send": 0.25
+      },
+      {
+        "name": "chamber",
+        "min": [
+          0.0,
+          -4.0,
+          -2.0
+        ],
+        "max": [
+          6.0,
+          4.0,
+          2.0
+        ],
+        "reverb_time": 0.9,
+        "reverb_send": 0.25
+      }
+    ],
+    "portals": [
+      {
+        "name": "door",
+        "rooms": [
+          "hall",
+          "chamber"
+        ],
+        "motion": [
+          [
+            0.0,
+            1.0
+          ],
+          [
+            1.5,
+            1.0
+          ],
+          [
+            2.0,
+            0.0
+          ],
+          [
+            4.0,
+            0.0
+          ],
+          [
+            4.5,
+            1.0
+          ]
+        ]
+      }
+    ]
+  },
+  "emitters": [
+    {
+      "name": "chamber_tone",
+      "kind": "tone",
+      "params": {
+        "frequency": 520.0,
+        "duration": 6.0,
+        "fade": 0.01
+      },
+      "trajectory": [
+        [
+          0.0,
+          2.5,
+          0.5,
+          0.0
+        ]
+      ],
+      "volume": 1.0,
+      "loop": false,
+      "events": [
+        [
+          5.0,
+          false
+        ]
+      ]
+    },
+    {
+      "name": "hall_tone",
+      "kind": "tone",
+      "params": {
+        "frequency": 330.0,
+        "duration": 6.0,
+        "fade": 0.01
+      },
+      "trajectory": [
+        [
+          0.0,
+          4.0,
+          -2.0,
+          0.0
+        ],
+        [
+          3.0,
+          4.0,
+          -2.0,
+          0.0
+        ],
+        [
+          3.000000001,
+          -4.0,
+          2.0,
+          0.0
+        ],
+        [
+          6.0,
+          -4.0,
+          2.0,
+          0.0
+        ]
+      ],
+      "volume": 1.0,
+      "loop": false,
+      "events": []
+    }
+  ]
+}

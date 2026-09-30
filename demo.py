@@ -18,7 +18,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 import soundfile as sf
 
-from spatial_audio import MotionRecording, Trajectory, render_recording
+from spatial_audio import (
+    DoorMotion,
+    MotionRecording,
+    Portal,
+    Room,
+    RoomScene,
+    Trajectory,
+    render_recording,
+)
 from spatial_audio.recording import EmitterSpec
 
 SR = 48000
@@ -123,6 +131,98 @@ def main():
     assert np.abs(result.samples[late, 1]).mean() > np.abs(result.samples[late, 0]).mean()
     assert max_diff < 1e-9
     print("L/R sweep and replay-equivalence checks passed.")
+
+    demo_rooms()
+
+
+def build_room_recording():
+    """Two rooms joined by a door; the door closes, then reopens."""
+    scene = RoomScene(
+        rooms=[
+            Room("hall", (-6.0, -4.0, -2.0), (0.0, 4.0, 2.0), reverb_time=0.7),
+            Room("chamber", (0.0, -4.0, -2.0), (6.0, 4.0, 2.0), reverb_time=0.9),
+        ],
+        portals=[
+            # Open until t=1.5, swings shut by t=2.0, stays closed, then
+            # reopens between t=4.0 and t=4.5.
+            Portal("door", "hall", "chamber",
+                   DoorMotion([(0.0, 1.0), (1.5, 1.0), (2.0, 0.0),
+                               (4.0, 0.0), (4.5, 1.0)])),
+        ],
+    )
+    return MotionRecording(
+        duration=DURATION,
+        sample_rate=SR,
+        listener_trajectory=Trajectory.linear(
+            [(0.0, (-3.0, 0.0, 0.0)), (6.0, (-1.0, 1.0, 0.0))]
+        ),
+        listener_forward=(1.0, 0.0, 0.0),
+        scene=scene,
+        emitters=[
+            # Tone in the other room: direct sound is muffled and quiet
+            # while the door is closed, but the chamber's reverb tail
+            # remains audible after the tone stops at t=5.
+            EmitterSpec(
+                name="chamber_tone",
+                kind="tone",
+                params={"frequency": 520.0, "duration": DURATION, "fade": 0.01},
+                trajectory=Trajectory.linear([(0.0, (2.5, 0.5, 0.0))]),
+                events=[(5.0, False)],
+            ),
+            # A second tone that teleports inside the hall at t=3
+            # (smoothed by the engine; no click).
+            EmitterSpec(
+                name="hall_tone",
+                kind="tone",
+                params={"frequency": 330.0, "duration": DURATION, "fade": 0.01},
+                trajectory=Trajectory.linear(
+                    [(0.0, (4.0, -2.0, 0.0)), (3.0, (4.0, -2.0, 0.0)),
+                     (3.0 + 1e-9, (-4.0, 2.0, 0.0)), (6.0, (-4.0, 2.0, 0.0))]
+                ),
+            ),
+        ],
+    )
+
+
+def demo_rooms():
+    recording = build_room_recording()
+    recording.save(OUT / "room_recording.json")
+
+    result = render_recording(recording, block_size=1024)
+    wav_path = OUT / "demo_rooms.wav"
+    sf.write(wav_path, result.samples, SR, subtype="PCM_16")
+
+    replayed = MotionRecording.load(OUT / "room_recording.json")
+    replay = render_recording(replayed, block_size=4099).samples
+    sf.write(OUT / "demo_rooms_replay.wav", replay, SR, subtype="PCM_16")
+    max_diff = float(np.max(np.abs(result.samples - replay)))
+
+    t, rms = channel_rms(result.samples)
+    fig, ax = plt.subplots(figsize=(10, 3.5))
+    ax.plot(t, rms[:, 0], label="left", color="#1f77b4")
+    ax.plot(t, rms[:, 1], label="right", color="#d62728")
+    for x, label in [(2.0, "door closed"), (4.5, "door open"), (5.0, "tone off")]:
+        ax.axvline(x, color="gray", ls="--", lw=0.8)
+        ax.text(x, ax.get_ylim()[1] * 0.9, label, rotation=90, va="top", fontsize=8)
+    ax.set_ylabel("RMS level")
+    ax.set_xlabel("time (s)")
+    ax.set_title("Two rooms + door: occlusion and reverb tail")
+    ax.legend()
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(OUT / "room_check.png", dpi=130)
+
+    print(f"wrote {wav_path} (door closes at 2 s, reopens at 4.5 s)")
+    print(f"room replay max |difference|: {max_diff:.3e}")
+    assert max_diff < 1e-9
+    # Door closed (2.5-4 s) must be clearly quieter than open (1-1.5 s),
+    # and the tail after the tone stops (5.2-5.6 s) must still be audible.
+    def level(t0, t1):
+        seg = result.samples[int(t0 * SR):int(t1 * SR)]
+        return float(np.sqrt(np.mean(seg ** 2)))
+    assert level(2.2, 2.9) < 0.6 * level(1.0, 1.5)
+    assert level(5.2, 5.6) > 1e-4
+    print("door occlusion and reverb-tail checks passed.")
 
 
 if __name__ == "__main__":

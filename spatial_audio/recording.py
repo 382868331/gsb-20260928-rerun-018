@@ -13,6 +13,7 @@ from .resources import SoundResource
 from .trajectory import Trajectory
 from .scene import Emitter, Listener
 from .engine import SpatialEngine, RenderResult
+from .rooms import RoomScene
 
 
 @dataclass
@@ -30,12 +31,13 @@ class MotionRecording:
     """Serializable description of a whole spatial motion take."""
 
     def __init__(self, duration, sample_rate, listener_trajectory=None,
-                 listener_forward=(0.0, 1.0, 0.0), emitters=None):
+                 listener_forward=(0.0, 1.0, 0.0), emitters=None, scene=None):
         self.duration = float(duration)
         self.sample_rate = int(sample_rate)
         self.listener_trajectory = listener_trajectory
         self.listener_forward = tuple(listener_forward)
         self.emitters = list(emitters or [])
+        self.scene = scene
 
     def to_dict(self):
         return {
@@ -44,6 +46,7 @@ class MotionRecording:
             "listener_forward": list(self.listener_forward),
             "listener_trajectory":
                 self.listener_trajectory.to_list() if self.listener_trajectory else None,
+            "scene": self.scene.to_dict() if self.scene is not None else None,
             "emitters": [
                 {
                     "name": e.name,
@@ -79,8 +82,11 @@ class MotionRecording:
             )
             for e in data["emitters"]
         ]
+        scene_data = data.get("scene")
+        scene = RoomScene.from_dict(scene_data) if scene_data else None
         return cls(data["duration"], data["sample_rate"], lt,
-                   data.get("listener_forward", (0.0, 1.0, 0.0)), specs)
+                   data.get("listener_forward", (0.0, 1.0, 0.0)), specs,
+                   scene=scene)
 
 
 def _build_resource(kind, params, sample_rate):
@@ -100,7 +106,8 @@ def build_engine(recording: MotionRecording) -> SpatialEngine:
                         trajectory=recording.listener_trajectory)
     if recording.listener_trajectory is not None:
         listener.position = recording.listener_trajectory.points[0]
-    engine = SpatialEngine(listener, sample_rate=recording.sample_rate)
+    engine = SpatialEngine(listener, sample_rate=recording.sample_rate,
+                           scene=recording.scene)
     for spec in recording.emitters:
         resource = _build_resource(spec.kind, spec.params, recording.sample_rate)
         initially_active = True

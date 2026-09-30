@@ -19,6 +19,7 @@ import numpy as np
 from scipy.signal import lfilter
 
 from .scene import Emitter, Listener
+from .rooms import RoomReverb
 
 SPEED_OF_SOUND = 343.0
 
@@ -54,6 +55,8 @@ class _EmitterRuntime:
         self.gain_l_state = 0.0   # smoothed geometry gain (left)
         self.gain_r_state = 0.0   # smoothed geometry gain (right)
         self.finished = False
+        self.lp_state = 0.0     # occlusion lowpass filter state
+        self.occl_state = 0.0   # smoothed occlusion (muffle) mix
 
 
 def _resample(resource_samples, playhead, rates, loop):
@@ -97,6 +100,8 @@ class SpatialEngine:
         gate_release_ms=15.0,
         smooth_ms=2.0,
         limit_threshold=0.95,
+        scene=None,
+        occlusion_cutoff=700.0,
     ):
         self.listener = listener
         self.sample_rate = int(sample_rate)
@@ -107,6 +112,19 @@ class SpatialEngine:
         self._release_coef = float(1.0 - np.exp(-dt / (gate_release_ms / 1000.0)))
         self._smooth_coef = float(1.0 - np.exp(-dt / (smooth_ms / 1000.0)))
         self.limit_threshold = float(limit_threshold)
+        self.scene = scene
+        a0 = float(1.0 - np.exp(-2.0 * np.pi * occlusion_cutoff / self.sample_rate))
+        self._lp_b = [a0]
+        self._lp_a = [1.0, -(1.0 - a0)]
+        if scene is not None:
+            self._reverbs = [
+                RoomReverb(self.sample_rate, room.reverb_time)
+                for room in scene.rooms
+            ]
+            self._reverb_gain_states = [0.0] * len(scene.rooms)
+        else:
+            self._reverbs = []
+            self._reverb_gain_states = []
         self.emitters = []
         self._runtimes = {}
         # emitter id -> list of (time, active), sample-accurate scheduling
@@ -179,6 +197,10 @@ class SpatialEngine:
         right = self.listener.right
 
         mixed = np.zeros((n, 2), dtype=np.float64)
+        scene = self.scene
+        if scene is not None:
+            listener_rooms = scene.room_index_at(lpos)
+            room_inputs = [np.zeros(n) for _ in scene.rooms]
         peaks = {}
         sb = [self._smooth_coef]
         sa = [1.0, -(1.0 - self._smooth_coef)]
@@ -218,12 +240,38 @@ class SpatialEngine:
             gain_l = dist_gain * gl * rear_gain * emitter.volume
             gain_r = dist_gain * gr * rear_gain * emitter.volume
 
+            if scene is not None:
+                source_rooms = scene.room_index_at(epos)
+                trans, muffle = scene.direct_transmission(
+                    listener_rooms, source_rooms, times
+                )
+                gain_l = gain_l * trans
+                gain_r = gain_r * trans
+                # Muffled copy through a fixed lowpass; the smoothed mix
+                # crossfades dry/muffled so the spectrum moves continuously.
+                muffled, lp_zf = lfilter(
+                    self._lp_b, self._lp_a, src, zi=[rt.lp_state]
+                )
+                rt.lp_state = float(lp_zf[0])
+                mix_s, oc_zf = lfilter(
+                    sb, sa, muffle, zi=[rt.occl_state]
+                )
+                rt.occl_state = float(oc_zf[0])
+                src = src * (1.0 - mix_s) + muffled * mix_s
+
             gl_s, zi = lfilter(sb, sa, gain_l, zi=[rt.gain_l_state])
             rt.gain_l_state = float(zi[0])
             gr_s, zi = lfilter(sb, sa, gain_r, zi=[rt.gain_r_state])
             rt.gain_r_state = float(zi[0])
 
             gate = self._gate(emitter, rt, time_seconds, times)
+
+            if scene is not None:
+                send_base = src * gate * dist_gain * emitter.volume
+                for ri, room in enumerate(scene.rooms):
+                    m = source_rooms == ri
+                    if m.any():
+                        room_inputs[ri][m] += send_base[m] * room.reverb_send
 
             ch_l = src * gl_s * gate
             ch_r = src * gr_s * gate
@@ -234,6 +282,16 @@ class SpatialEngine:
                 float(np.max(np.abs(ch_l))),
                 float(np.max(np.abs(ch_r))),
             )
+
+        if scene is not None:
+            for ri, room in enumerate(scene.rooms):
+                wet = self._reverbs[ri].process(room_inputs[ri])
+                target = scene.reverb_transmission(listener_rooms, ri, times)
+                g, zi = lfilter(
+                    sb, sa, target, zi=[self._reverb_gain_states[ri]]
+                )
+                self._reverb_gain_states[ri] = float(zi[0])
+                mixed += wet * g[:, None]
         return mixed, peaks
 
     def _limit(self, stereo):
