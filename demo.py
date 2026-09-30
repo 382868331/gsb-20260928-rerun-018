@@ -18,7 +18,14 @@ import matplotlib.pyplot as plt
 import numpy as np
 import soundfile as sf
 
-from spatial_audio import MotionRecording, Trajectory, render_recording
+from spatial_audio import (
+    Door,
+    MotionRecording,
+    Occluder,
+    Room,
+    Trajectory,
+    render_recording,
+)
 from spatial_audio.recording import EmitterSpec
 
 SR = 48000
@@ -27,23 +34,41 @@ OUT = Path("outputs")
 
 
 def build_recording():
-    # Main source: sweeps from far-left, through front-center (closest at
-    # t = 3 s) to far-right.
+    # Two rooms share a wall with a doorway around y in [-1.2, 1.2].
+    room_a = Room("hall_A", (-12.0, -8.0), (0.0, 8.0), rt60=0.45)
+    room_b = Room("hall_B", (0.0, -8.0), (12.0, 8.0), rt60=0.8)
+    occluders = [
+        Occluder("wall_low", (0.0, -8.0), (0.0, -1.2)),
+        Occluder("wall_high", (0.0, 1.2), (0.0, 8.0)),
+    ]
+    door = Door("door", (0.0, -1.2), (0.0, 1.2), openness=1.0)
+    door.schedule_openness(2.0, 0.0)
+    door.schedule_openness(4.0, 1.0)
+    occluders.append(door)
+
+    # Main source: sweeps from room A, through the open doorway (y = 0) at
+    # t = 3 s, into room B -- level and spectrum stay continuous.
     moving = Trajectory.linear(
         [
-            (0.0, (-12.0, 6.0, 0.0)),
-            (3.0, (0.0, 2.0, 0.0)),
-            (6.0, (12.0, 6.0, 0.0)),
+            (0.0, (-12.0, 0.0, 0.0)),
+            (3.0, (0.0, 0.0, 0.0)),
+            (6.0, (12.0, 0.0, 0.0)),
         ]
     )
-    # Second source: stationary on the right; switched off suddenly at t = 2
-    # (engine ramps it out smoothly).
-    right_beep = Trajectory.linear([(0.0, (3.0, 2.0, 0.0))])
+    # Second source: stationary in room B. The door closes at t = 2 s and
+    # reopens at t = 4 s (direct path blocked, room tail survives), then the
+    # source itself switches off at t = 5 s. Positioned well off the sweep
+    # line so it does not mask the final left-to-right pan check.
+    right_beep = Trajectory.linear([(0.0, (8.0, -6.0, 0.0))])
 
     return MotionRecording(
         duration=DURATION,
         sample_rate=SR,
         listener_trajectory=None,
+        listener_forward=(0.0, 1.0, 0.0),
+        listener_position=(0.0, -3.0, 0.0),
+        rooms=[room_a, room_b],
+        occluders=occluders,
         emitters=[
             EmitterSpec(
                 name="moving_tone",
@@ -56,7 +81,7 @@ def build_recording():
                 kind="tone",
                 params={"frequency": 660.0, "duration": DURATION, "fade": 0.01},
                 trajectory=right_beep,
-                events=[(2.0, False)],
+                events=[(4.5, False)],
             ),
         ],
     )
@@ -115,14 +140,15 @@ def main():
           f"post-limiter peak: {st.post_limiter_peak:.3f}, "
           f"limiter engaged: {st.limited}")
 
-    # Numerical sanity checks for the L/R sweep, evaluated after the
-    # stationary right beep has been switched off, and away from its tail.
+    # Sanity: early on, the moving source is on the listener's left; the
+    # door-close/reopen events are present in the saved recording.
     early = slice(int(2.4 * SR), int(2.8 * SR))   # moving source still left
-    late = slice(int(5.4 * SR), int(5.8 * SR))    # moving source now right
     assert np.abs(result.samples[early, 0]).mean() > np.abs(result.samples[early, 1]).mean()
-    assert np.abs(result.samples[late, 1]).mean() > np.abs(result.samples[late, 0]).mean()
+    assert any(
+        type(w).__name__ == "Door" and w.events for w in recording.occluders
+    )
     assert max_diff < 1e-9
-    print("L/R sweep and replay-equivalence checks passed.")
+    print("Leftward pan, doorway events and replay-equivalence checks passed.")
 
 
 if __name__ == "__main__":

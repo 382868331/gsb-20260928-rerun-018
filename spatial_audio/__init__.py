@@ -16,6 +16,7 @@ from .trajectory import Trajectory, Waypoint
 from .scene import Emitter, Listener
 from .engine import SpatialEngine, RenderResult
 from .recording import MotionRecording, render_recording
+from .rooms import Door, Occluder, Room
 
 __all__ = [
     "SoundResource",
@@ -25,6 +26,9 @@ __all__ = [
     "Listener",
     "SpatialEngine",
     "RenderResult",
+    "Room",
+    "Occluder",
+    "Door",
     "MotionRecording",
     "render_recording",
 ]

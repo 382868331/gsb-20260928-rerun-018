@@ -13,6 +13,7 @@ from .resources import SoundResource
 from .trajectory import Trajectory
 from .scene import Emitter, Listener
 from .engine import SpatialEngine, RenderResult
+from .rooms import Door, OCCLUDER_CLASSES, Occluder, Room
 
 
 @dataclass
@@ -30,20 +31,30 @@ class MotionRecording:
     """Serializable description of a whole spatial motion take."""
 
     def __init__(self, duration, sample_rate, listener_trajectory=None,
-                 listener_forward=(0.0, 1.0, 0.0), emitters=None):
+                 listener_forward=(0.0, 1.0, 0.0), emitters=None,
+                 rooms=None, occluders=None, listener_position=None):
         self.duration = float(duration)
         self.sample_rate = int(sample_rate)
         self.listener_trajectory = listener_trajectory
         self.listener_forward = tuple(listener_forward)
         self.emitters = list(emitters or [])
+        self.rooms = list(rooms or [])
+        self.occluders = list(occluders or [])
+        self.listener_position = listener_position
 
     def to_dict(self):
         return {
             "duration": self.duration,
             "sample_rate": self.sample_rate,
             "listener_forward": list(self.listener_forward),
+            "listener_position": (
+                list(self.listener_position)
+                if self.listener_position is not None else None
+            ),
             "listener_trajectory":
                 self.listener_trajectory.to_list() if self.listener_trajectory else None,
+            "rooms": [r.to_dict() for r in self.rooms],
+            "occluders": [w.to_dict() for w in self.occluders],
             "emitters": [
                 {
                     "name": e.name,
@@ -79,8 +90,13 @@ class MotionRecording:
             )
             for e in data["emitters"]
         ]
+        rooms = [Room.from_dict(d) for d in data.get("rooms", [])]
+        occluders = [OCCLUDER_CLASSES[d.get("kind", "wall")].from_dict(d)
+                     for d in data.get("occluders", [])]
         return cls(data["duration"], data["sample_rate"], lt,
-                   data.get("listener_forward", (0.0, 1.0, 0.0)), specs)
+                   data.get("listener_forward", (0.0, 1.0, 0.0)), specs,
+                   rooms=rooms, occluders=occluders,
+                   listener_position=data.get("listener_position"))
 
 
 def _build_resource(kind, params, sample_rate):
@@ -100,7 +116,14 @@ def build_engine(recording: MotionRecording) -> SpatialEngine:
                         trajectory=recording.listener_trajectory)
     if recording.listener_trajectory is not None:
         listener.position = recording.listener_trajectory.points[0]
-    engine = SpatialEngine(listener, sample_rate=recording.sample_rate)
+    elif recording.listener_position is not None:
+        listener.set_position(recording.listener_position)
+    engine = SpatialEngine(
+        listener,
+        sample_rate=recording.sample_rate,
+        rooms=recording.rooms,
+        occluders=recording.occluders,
+    )
     for spec in recording.emitters:
         resource = _build_resource(spec.kind, spec.params, recording.sample_rate)
         initially_active = True
