@@ -11,6 +11,7 @@ Outputs (in outputs/):
 """
 
 from pathlib import Path
+import json
 
 import matplotlib
 matplotlib.use("Agg")
@@ -27,7 +28,12 @@ from spatial_audio import (
     Trajectory,
     render_recording,
 )
-from spatial_audio.recording import EmitterSpec
+from spatial_audio.recording import (
+    EmitterSpec,
+    build_engine,
+    recording_with_doors,
+    render_recording_resumed,
+)
 
 SR = 48000
 DURATION = 6.0
@@ -133,6 +139,7 @@ def main():
     print("L/R sweep and replay-equivalence checks passed.")
 
     demo_rooms()
+    demo_multipath()
 
 
 def build_room_recording():
@@ -223,6 +230,93 @@ def demo_rooms():
     assert level(2.2, 2.9) < 0.6 * level(1.0, 1.5)
     assert level(5.2, 5.6) > 1e-4
     print("door occlusion and reverb-tail checks passed.")
+
+
+def demo_multipath():
+    """Three connected rooms: chain propagation, door A/B and mid-take resume.
+
+    The listener walks from room A through B into C where the source
+    plays. The two doors move at different times, and the same recorded
+    take is auditioned once with the doors as recorded and once with both
+    shut; the source start/stop schedule is unchanged. The same take is
+    also rendered continuously and as two halves with the engine state
+    saved to disk in between; the results match sample-for-sample.
+    """
+    duration = 5.0
+    scene = RoomScene(
+        rooms=[
+            Room("a", (-8.0, -4.0, -2.0), (0.0, 4.0, 2.0), reverb_time=0.5),
+            Room("b", (0.0, -4.0, -2.0), (8.0, 4.0, 2.0), reverb_time=0.7),
+            Room("c", (8.0, -4.0, -2.0), (16.0, 4.0, 2.0), reverb_time=0.9),
+        ],
+        portals=[
+            Portal("ab", "a", "b",
+                   DoorMotion([(0.0, 1.0), (1.4, 1.0), (2.0, 0.0),
+                               (3.2, 0.0), (3.7, 1.0)])),
+            Portal("bc", "b", "c",
+                   DoorMotion([(0.0, 1.0), (0.8, 1.0), (1.3, 0.0),
+                               (2.4, 0.0), (3.0, 1.0)])),
+        ],
+    )
+    rec = MotionRecording(
+        duration=duration,
+        sample_rate=SR,
+        # Listener crosses A->B at t=2 s and B->C at t=4 s.
+        listener_trajectory=Trajectory.linear(
+            [(0.0, (-4.0, 0.0, 0.0)), (5.0, (12.0, 0.0, 0.0))]
+        ),
+        listener_forward=(1.0, 0.0, 0.0),
+        scene=scene,
+        emitters=[
+            EmitterSpec(
+                name="c_tone",
+                kind="tone",
+                params={"frequency": 470.0, "duration": duration, "fade": 0.01},
+                trajectory=Trajectory.linear([(0.0, (12.0, 1.0, 0.0))]),
+                events=[(4.2, False)],  # tail after stop
+            ),
+        ],
+    )
+    rec.save(OUT / "multipath_recording.json")
+    result = render_recording(rec, block_size=1024)
+    sf.write(OUT / "demo_multipath.wav", result.samples, SR, subtype="PCM_16")
+
+    # Same take, same source schedule, both doors forced shut.
+    shut = recording_with_doors(rec, {
+        "ab": DoorMotion([(0.0, 0.0)]),
+        "bc": DoorMotion([(0.0, 0.0)]),
+    })
+    shut_out = render_recording(shut, block_size=4099)
+    sf.write(OUT / "demo_multipath_doors_shut.wav", shut_out.samples, SR,
+             subtype="PCM_16")
+    assert shut.emitters[0].events == [(4.2, False)]
+
+    # Continuous vs render-save-render at t = 2.31 s.
+    cut = 2.31
+    engine = build_engine(rec)
+    first = engine.render(cut, block_size=257).samples
+    state_path = OUT / "multipath_state.json"
+    engine.save_state(state_path)
+    second = render_recording_resumed(
+        rec, json.loads(state_path.read_text()), block_size=333
+    ).samples
+    glued = np.concatenate([first, second], axis=0)
+    assert glued.shape == result.samples.shape
+    max_diff = float(np.max(np.abs(glued - result.samples)))
+    sf.write(OUT / "demo_multipath_resumed.wav", glued, SR, subtype="PCM_16")
+
+    t = np.arange(len(result.samples)) / SR
+    def level(s, t0, t1):
+        seg = s[(t >= t0) & (t < t1)]
+        return float(np.sqrt(np.mean(seg ** 2)))
+    # Both doors open early (chain fully open); shut take is much quieter.
+    assert level(shut_out.samples, 0.4, 0.7) < 0.2 * level(result.samples, 0.4, 0.7)
+    # After the source stops, the room-C tail is still audible across rooms.
+    assert level(result.samples, 4.4, 4.8) > 1e-4
+    print(f"wrote demo_multipath.wav (3 rooms, 2 moving doors, tail after stop)")
+    print(f"doors-shut replay keeps events {shut.emitters[0].events}")
+    print(f"save-at-{cut}s/resume max |difference|: {max_diff:.3e}")
+    print("multi-room chain, door-A/B and mid-take resume checks passed.")
 
 
 if __name__ == "__main__":

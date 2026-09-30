@@ -1,20 +1,26 @@
 """Rooms, doors (portals) and per-room reverbs for occlusion-aware rendering.
 
-Geometry model:
+Geometry / propagation model:
 
 - Rooms are axis-aligned boxes. A point is "inside" at most one room
   (first match wins); points outside every room form one shared "outside".
 - A Portal connects two rooms and has a DoorMotion: keyframed open
   fraction in [0, 1], smoothstep-interpolated so volume/spectrum changes
   are continuous in time and independent of the render block size.
-- Direct-path transmission between the listener room and a source room:
-  same room -> (gain 1, no muffling); through a portal -> gain and
-  lowpass mix follow the open fraction; no connecting portal -> heavy
-  occlusion.
+- Sound propagates along the graph of rooms joined by portals. Every
+  *simple* path from the source room to the listener room contributes at
+  once (a short direct chain and a chain detouring through other rooms
+  can therefore arrive together). Each door on a chain multiplies the
+  signal by its current coupling, so doors moving anywhere along the
+  chain change the result continuously. Switching which paths exist
+  (e.g. the listener crossing a boundary) never erases another room's
+  reverb tail: tail processing state always lives with the source room
+  and only the smooth output gain changes.
 
-Reverbs are built from feedback comb + allpass filters implemented with
-scipy lfilter and carried zi state, so reverb tails are sample-exact
-regardless of how the render is split into blocks.
+Reverbs are feedback comb + allpass filters implemented with scipy
+lfilter and carried zi state, so reverb tails are sample-exact regardless
+of how the render is split into blocks; the zi arrays can be exported and
+restored to suspend a render mid-way and resume it later.
 """
 
 from __future__ import annotations
@@ -121,21 +127,152 @@ class Portal:
 
 
 class RoomScene:
-    """Rooms + portals; answers direct/reverb transmission queries."""
+    """Rooms + portals; answers multi-path transmission queries.
 
-    # Direct path through a portal: closed door keeps only a quiet,
-    # muffled leakage; open door is transparent.
+    Each portal crossing has two independent couplings:
+
+    - dry coupling ``closed + (1 - closed) * openness`` carries the
+      spectrally flat (direct) signal;
+    - muffled coupling ``(1 - openness)`` is fed by a fixed lowpassed copy
+      of the signal, so the heard spectrum moves continuously as the door
+      swings.
+
+    For every simple room-to-room path the path gain is the product of
+    its couplings; the gains of all paths are summed in parallel. The
+    muffled mix of the combined path is the muffled fraction of that
+    gain. Chains longer than one portal also keep a small per-hop
+    muffling so propagation through several rooms sounds progressively
+    duller.
+    """
+
+    # Direct sound through a closed portal keeps only a quiet, muffled
+    # leakage; an open portal is transparent.
     DIRECT_CLOSED_GAIN = 0.08
-    DIRECT_NO_PATH_GAIN = 0.02
-    # Reverb heard across rooms: a closed door still lets the other
-    # room's tail through clearly enough to be distinguishable.
+    # Reverb tails couple through a closed portal more strongly, so a
+    # neighbour's ringing stays distinguishable after the direct sound
+    # is blocked.
     REVERB_CLOSED_GAIN = 0.3
-    REVERB_NO_PATH_GAIN = 0.05
+    # Extra high-frequency loss per crossed portal on multi-hop chains.
+    # Extra muffle fraction accumulated per crossed portal on chains.
+    CHAIN_MUFFLE_PER_HOP = 0.12
+    # Graph search guard: room scenes are tiny; longer simple paths are
+    # acoustically negligible (products of < 1 couplings decay quickly).
+    MAX_PATH_HOPS = 5
 
     def __init__(self, rooms, portals=()):
         self.rooms = list(rooms)
         self.portals = list(portals)
         self._index = {r.name: i for i, r in enumerate(self.rooms)}
+        self._simple_paths = {}
+
+    def _enumerate_simple_paths(self, src, dst):
+        """All simple paths src -> dst as tuples of room indices.
+
+        Cached per (src, dst); parallel portals between the same two
+        rooms are merged into one adjacency edge (their individual
+        openness is summed at evaluation time).
+        """
+        key = (int(src), int(dst))
+        cached = self._simple_paths.get(key)
+        if cached is not None:
+            return cached
+        n = len(self.rooms)
+        adj = [set() for _ in range(n)]
+        for portal in self.portals:
+            ia = self._index.get(portal.room_a)
+            ib = self._index.get(portal.room_b)
+            if ia is None or ib is None:
+                continue
+            adj[ia].add(ib)
+            adj[ib].add(ia)
+        paths = []
+        if 0 <= src < n and 0 <= dst < n:
+            stack = [(src, (src,))]
+            while stack:
+                node, path = stack.pop()
+                if len(path) - 1 >= self.MAX_PATH_HOPS:
+                    continue
+                for nxt in sorted(adj[node], reverse=True):
+                    if nxt in path:
+                        continue
+                    npath = path + (nxt,)
+                    if nxt == dst:
+                        paths.append(npath)
+                    else:
+                        stack.append((nxt, npath))
+        self._simple_paths[key] = paths
+        return paths
+
+    def _portal_couplings(self, times):
+        """Per-portal (dry, muffle) coupling arrays at the given times.
+
+        Returns a dict keyed by unordered room-index pair; when several
+        portals join the same room pair their couplings add (parallel
+        doors / openings), clipped to a transparent maximum of 1.
+        """
+        n = len(times)
+        edges = {}
+        for portal in self.portals:
+            ia = self._index.get(portal.room_a)
+            ib = self._index.get(portal.room_b)
+            if ia is None or ib is None:
+                continue
+            op = portal.motion.open_fraction(times)
+            gain = np.clip(
+                self.DIRECT_CLOSED_GAIN
+                + (1.0 - self.DIRECT_CLOSED_GAIN) * op,
+                0.0, 1.0,
+            )
+            dry = np.clip(gain * op, 0.0, 1.0)
+            wet = np.clip(gain * (1.0 - op), 0.0, 1.0)
+            key = (min(ia, ib), max(ia, ib))
+            if key in edges:
+                prev_dry, prev_wet = edges[key]
+                edges[key] = (np.clip(prev_dry + dry, 0.0, 1.0),
+                              np.clip(prev_wet + wet, 0.0, 1.0))
+            else:
+                edges[key] = (dry, wet)
+        return edges
+
+    def _reverb_couplings(self, times):
+        """Like :meth:`_portal_couplings` for the reverb bus (scalar gain)."""
+        edges = {}
+        for portal in self.portals:
+            ia = self._index.get(portal.room_a)
+            ib = self._index.get(portal.room_b)
+            if ia is None or ib is None:
+                continue
+            op = portal.motion.open_fraction(times)
+            g = np.clip(
+                self.REVERB_CLOSED_GAIN
+                + (1.0 - self.REVERB_CLOSED_GAIN) * op,
+                0.0, 1.0,
+            )
+            key = (min(ia, ib), max(ia, ib))
+            edges[key] = np.clip(edges.get(key, 0.0) + g, 0.0, 1.0)
+        return edges
+
+    def _combined_paths(self, src, dst, times, edge_couplings):
+        """Sum (dry_gain, muffled_gain) over all simple src -> dst paths."""
+        n = len(times)
+        dry_total = np.zeros(n)
+        wet_total = np.zeros(n)
+        for path in self._enumerate_simple_paths(src, dst):
+            dry_p = np.ones(n)
+            wet_p = np.zeros(n)
+            hops = len(path) - 1
+            for a, b in zip(path[:-1], path[1:]):
+                dry_e, wet_e = edge_couplings[(min(a, b), max(a, b))]
+                new_dry = dry_p * dry_e
+                new_wet = wet_p * dry_e + dry_p * wet_e
+                dry_p, wet_p = new_dry, new_wet
+            if hops > 1:
+                chain = min(1.0, self.CHAIN_MUFFLE_PER_HOP * hops)
+                wet_p = np.clip(wet_p + dry_p * chain, 0.0, 1.0)
+                dry_p = dry_p * (1.0 - chain)
+            dry_total += dry_p
+            wet_total += wet_p
+        return np.clip(dry_total, 0.0, 1.0), np.clip(wet_total, 0.0, 1.0)
 
     def room_index_at(self, positions):
         """Room index per point (n, 3); -1 when outside every room."""
@@ -149,52 +286,80 @@ class RoomScene:
         return idx
 
     def direct_transmission(self, listener_idx, source_idx, times):
-        """Per-sample (gain, muffle_mix) for the direct path.
+        """Per-sample (gain, muffle_mix) summed over all room paths.
 
-        muffle_mix in [0, 1] crossfades to a fixed lowpassed copy of the
-        signal, so the spectrum changes continuously with door motion.
+        Same room -> (1, 0). Otherwise every simple room-graph path from
+        source room to listener room contributes; ``muffle_mix`` is the
+        muffled fraction of the summed gain and crossfades to a fixed
+        lowpassed copy of the signal. With no connecting path the sound
+        is fully blocked (gain 0) rather than artificially leaking.
         """
         n = len(times)
-        gain = np.ones(n)
-        mix = np.zeros(n)
-        diff = listener_idx != source_idx
-        if diff.any():
-            gain[diff] = self.DIRECT_NO_PATH_GAIN
-            mix[diff] = 1.0
-            for portal in self.portals:
-                ia = self._index.get(portal.room_a, -2)
-                ib = self._index.get(portal.room_b, -2)
-                m = diff & (
-                    ((listener_idx == ia) & (source_idx == ib))
-                    | ((listener_idx == ib) & (source_idx == ia))
-                )
-                if m.any():
-                    op = portal.motion.open_fraction(times[m])
-                    gain[m] = self.DIRECT_CLOSED_GAIN + (1.0 - self.DIRECT_CLOSED_GAIN) * op
-                    mix[m] = 1.0 - op
+        gain = np.zeros(n)
+        mix = np.ones(n)
+        edges = self._portal_couplings(times)
+        for s0 in np.unique(source_idx):
+            for l0 in np.unique(listener_idx):
+                s, l = int(s0), int(l0)
+                m = (source_idx == s) & (listener_idx == l)
+                if not m.any():
+                    continue
+                if s == l and s >= 0 and l >= 0:
+                    gain[m] = 1.0
+                    mix[m] = 0.0
+                    continue
+                if s < 0 or l < 0:
+                    continue
+                dry, wet = self._combined_paths(s, l, times, edges)
+                total = dry + wet
+                gain[m] = np.minimum(total, 1.0)[m]
+                mix[m] = np.where(
+                    total > 1e-12, wet / np.maximum(total, 1e-12), 1.0
+                )[m]
         return gain, mix
 
     def reverb_transmission(self, listener_idx, room_i, times):
-        """Per-sample gain at which room_i's reverb reaches the listener."""
+        """Per-sample gain at which room_i's reverb reaches the listener.
+
+        Same room -> 1; otherwise all simple room-graph paths contribute.
+        """
         n = len(times)
-        gain = np.full(n, self.REVERB_NO_PATH_GAIN)
-        same = listener_idx == room_i
-        gain[same] = 1.0
-        rest = ~same
-        if rest.any():
-            for portal in self.portals:
-                ia = self._index.get(portal.room_a, -2)
-                ib = self._index.get(portal.room_b, -2)
-                if room_i == ia:
-                    m = rest & (listener_idx == ib)
-                elif room_i == ib:
-                    m = rest & (listener_idx == ia)
-                else:
-                    continue
-                if m.any():
-                    op = portal.motion.open_fraction(times[m])
-                    gain[m] = self.REVERB_CLOSED_GAIN + (1.0 - self.REVERB_CLOSED_GAIN) * op
+        gain = np.zeros(n)
+        edges = self._reverb_couplings(times)
+        for l in np.unique(listener_idx):
+            m = listener_idx == l
+            if not m.any():
+                continue
+            if l == room_i:
+                gain[m] = 1.0
+            elif l < 0 or room_i < 0:
+                continue
+            else:
+                g = np.zeros(n)
+                for path in self._enumerate_simple_paths(int(room_i), int(l)):
+                    gp = np.ones(n)
+                    for a, b in zip(path[:-1], path[1:]):
+                        gp *= edges[(min(a, b), max(a, b))]
+                    g += gp
+                gain[m] = np.clip(g, 0.0, 1.0)[m]
         return gain
+
+    def with_door_motions(self, motions):
+        """Return a copy whose portals use new DoorMotion values.
+
+        ``motions`` maps portal name to :class:`DoorMotion`; unspecified
+        portals keep their motion. Used to replay one recorded take with
+        different door states while the source start/stop schedule stays
+        exactly the same.
+        """
+        portals = [
+            Portal(p.name, p.room_a, p.room_b,
+                   motions.get(p.name, p.motion))
+            for p in self.portals
+        ]
+        return RoomScene(
+            [Room.from_dict(r.to_dict()) for r in self.rooms], portals
+        )
 
     def to_dict(self):
         return {
@@ -262,3 +427,29 @@ class RoomReverb:
             out[:, ch] = y
         return out
 
+    def get_state(self):
+        """Export all filter delay lines for suspend/resume."""
+        state = []
+        for combs, allpasses in self._channels:
+            state.append({
+                "combs": [np.asarray(zi).tolist() for _, _, zi in combs],
+                "allpasses": [np.asarray(zi).tolist() for _, _, zi in allpasses],
+            })
+        return state
+
+    def set_state(self, state):
+        """Restore delay lines previously produced by :meth:`get_state`."""
+        for ch, chs in enumerate(state):
+            combs, allpasses = self._channels[ch]
+            for i, zi in enumerate(chs["combs"]):
+                b, a, _ = combs[i]
+                zi = np.asarray(zi, dtype=np.float64)
+                if zi.shape != combs[i][2].shape:
+                    raise ValueError("comb state length mismatch")
+                combs[i] = (b, a, zi.copy())
+            for i, zi in enumerate(chs["allpasses"]):
+                b, a, _ = allpasses[i]
+                zi = np.asarray(zi, dtype=np.float64)
+                if zi.shape != allpasses[i][2].shape:
+                    raise ValueError("allpass state length mismatch")
+                allpasses[i] = (b, a, zi.copy())

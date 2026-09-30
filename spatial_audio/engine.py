@@ -129,6 +129,13 @@ class SpatialEngine:
         self._runtimes = {}
         # emitter id -> list of (time, active), sample-accurate scheduling
         self._events = {}
+        self._current_time = 0.0
+        # Integer index of the current engine clock within the take:
+        # sample-centered time is (clock_sample + 0.5) / sample_rate.
+        # Keeping the index exactly integer makes a render split at an
+        # arbitrary number of samples bit-identical to one continuous
+        # render regardless of block size.
+        self._clock_sample = 0
 
     def add_emitter(self, emitter):
         if emitter not in self.emitters:
@@ -146,6 +153,87 @@ class SpatialEngine:
         self._events.setdefault(id(emitter), []).append(
             (float(time_seconds), bool(active))
         )
+
+    @property
+    def current_time(self):
+        """Continuous time up to which this engine has rendered."""
+        return self._current_time
+
+    def suspend_state(self):
+        """Snapshot every piece of carried render state.
+
+        The snapshot is JSON-serialisable (plain lists) and lets a render
+        be stopped mid-way and resumed on an identically constructed
+        engine with sample-exact output; reverb delay lines are included,
+        so tails that have not decayed yet are never erased.
+        """
+        emitters_state = []
+        for emitter in self.emitters:
+            rt = self._runtimes[id(emitter)]
+            emitters_state.append({
+                "name": emitter.name,
+                "playhead": rt.playhead,
+                "env_state": rt.env_state,
+                "gain_l_state": rt.gain_l_state,
+                "gain_r_state": rt.gain_r_state,
+                "lp_state": rt.lp_state,
+                "occl_state": rt.occl_state,
+                "finished": rt.finished,
+            })
+        return {
+            "time": self._current_time,
+            "clock_sample": self._clock_sample,
+            "emitters": emitters_state,
+            "reverb_gain_states": list(self._reverb_gain_states),
+            "reverbs": [r.get_state() for r in self._reverbs],
+        }
+
+    def restore_state(self, state):
+        """Restore a snapshot from :meth:`suspend_state`.
+
+        Emitters are matched by name; the engine must be rebuilt with the
+        same scene and emitters (e.g. via ``build_engine`` of the same
+        recording) before restoring.
+        """
+        by_name = {e.name: e for e in self.emitters}
+        for es in state["emitters"]:
+            emitter = by_name.get(es["name"])
+            if emitter is None:
+                raise ValueError(f"unknown emitter in saved state: {es['name']}")
+            rt = self._runtimes[id(emitter)]
+            rt.playhead = float(es["playhead"])
+            rt.env_state = float(es["env_state"])
+            rt.gain_l_state = float(es["gain_l_state"])
+            rt.gain_r_state = float(es["gain_r_state"])
+            rt.lp_state = float(es["lp_state"])
+            rt.occl_state = float(es["occl_state"])
+            rt.finished = bool(es["finished"])
+        if len(state.get("reverbs", [])) != len(self._reverbs):
+            raise ValueError("reverb state does not match current scene")
+        for reverb, rs in zip(self._reverbs, state["reverbs"]):
+            reverb.set_state(rs)
+        gains = state.get("reverb_gain_states", [])
+        if len(gains) != len(self._reverb_gain_states):
+            raise ValueError("reverb gain state does not match current scene")
+        self._reverb_gain_states = [float(g) for g in gains]
+        self._clock_sample = int(state.get(
+            "clock_sample",
+            round(float(state["time"]) * self.sample_rate + 0.5),
+        ))
+        self._current_time = (self._clock_sample - 0.5) / self.sample_rate
+        return self
+
+    def save_state(self, path):
+        """Write :meth:`suspend_state` to a JSON file."""
+        import json
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self.suspend_state(), f)
+
+    def load_state(self, path):
+        """Read a state file written by :meth:`save_state`."""
+        import json
+        with open(path, "r", encoding="utf-8") as f:
+            return self.restore_state(json.load(f))
 
     def _listener_pose(self, times):
         traj = getattr(self.listener, "trajectory", None)
@@ -190,7 +278,7 @@ class SpatialEngine:
     def render_block(self, time_seconds, num_samples):
         """Render one block starting at continuous time time_seconds."""
         n = int(num_samples)
-        times = time_seconds + (np.arange(n) + 0.5) / self.sample_rate
+        times = time_seconds + np.arange(n) / self.sample_rate
 
         lpos, lvel = self._listener_pose(times)
         fwd = self.listener.forward
@@ -308,20 +396,40 @@ class SpatialEngine:
         reduction = float(np.max(np.abs(stereo) - np.abs(limited))) if stereo.size else 0.0
         return limited, reduction
 
-    def render(self, duration, block_size=1024):
-        """Render duration seconds; block_size never changes the result."""
+    def render(self, duration, block_size=1024, start_time=None):
+        """Render ``duration`` seconds and advance the engine clock.
+
+        Without ``start_time`` rendering continues from the engine clock
+        (0 for a fresh engine, or the sample reached by previous /
+        restored blocks), so a render split into several calls with a
+        saved state in between is sample-exact with one continuous
+        render, independent of the block size used for either half.
+        ``start_time`` (seconds) may instead jump the clock; it is rounded
+        to the nearest sample boundary.
+        """
         n_total = int(round(duration * self.sample_rate))
+        if start_time is not None:
+            self._clock_sample = int(round(float(start_time) * self.sample_rate))
+            self._current_time = (self._clock_sample - 0.5) / self.sample_rate
         chunks = []
         emitter_peaks = {}
-        pos, t0 = 0, 0.0
+        pos = 0
+        # Every sample is timed from an exact integer sample index into
+        # the take (time = (k + 0.5) / sample_rate), never by accumulating
+        # float block durations, so split and continuous renders share the
+        # exact same sample times and recursive filters.
         while pos < n_total:
             n = min(int(block_size), n_total - pos)
-            block, peaks = self.render_block(t0, n)
+            k0 = self._clock_sample + pos
+            block_t0 = (k0 + 0.5) / self.sample_rate
+            block, peaks = self.render_block(block_t0, n)
             chunks.append(block)
             for name, pk in peaks.items():
                 emitter_peaks[name] = max(emitter_peaks.get(name, 0.0), pk)
             pos += n
-            t0 += n / self.sample_rate
+        self._clock_sample += pos
+        # Clock stores the centered time of the last rendered sample.
+        self._current_time = (self._clock_sample - 0.5) / self.sample_rate
 
         raw = np.concatenate(chunks, axis=0) if chunks else np.zeros((0, 2))
         pre_peak = float(np.max(np.abs(raw))) if raw.size else 0.0

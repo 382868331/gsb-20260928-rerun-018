@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+import numpy as np
 
 from .resources import SoundResource
 from .trajectory import Trajectory
 from .scene import Emitter, Listener
-from .engine import SpatialEngine, RenderResult
+from .engine import SpatialEngine, RenderResult, RenderStats
 from .rooms import RoomScene
 
 
@@ -131,3 +132,66 @@ def build_engine(recording: MotionRecording) -> SpatialEngine:
 def render_recording(recording: MotionRecording, block_size: int = 1024) -> RenderResult:
     engine = build_engine(recording)
     return engine.render(recording.duration, block_size=block_size)
+
+
+def render_recording_resumed(recording: MotionRecording, state, block_size=1024,
+                             duration=None):
+    """Build an engine, restore a suspended state and render on.
+
+    ``state`` is a dict from ``SpatialEngine.suspend_state`` (or the JSON
+    loaded from a state file). Rendering continues for ``duration``
+    seconds (default: the recording's remaining duration), so a take saved
+    mid-way and continued has the same total length and samples as one
+    continuously rendered take.
+    """
+    engine = build_engine(recording)
+    engine.restore_state(state)
+    remaining = recording.duration - engine.current_time
+    if duration is None:
+        duration = remaining
+    return engine.render(duration, block_size=block_size)
+
+
+def recording_with_doors(recording: MotionRecording, door_motions):
+    """Copy a recording with new door states, keeping all motion/events.
+
+    ``door_motions`` maps portal name to :class:`DoorMotion`. Source
+    trajectories, resources, volume and start/stop events are untouched,
+    so different door openings can be auditioned against one recorded
+    take. The returned recording is a separate object.
+    """
+    if recording.scene is None:
+        raise ValueError("recording has no room scene / doors")
+    new_scene = recording.scene.with_door_motions(door_motions)
+    return MotionRecording(
+        duration=recording.duration,
+        sample_rate=recording.sample_rate,
+        listener_trajectory=recording.listener_trajectory,
+        listener_forward=recording.listener_forward,
+        emitters=list(recording.emitters),
+        scene=new_scene,
+    )
+
+
+def concat_results(first: RenderResult, second: RenderResult) -> RenderResult:
+    """Concatenate two consecutive raw renders of the same take.
+
+    Inputs should be pre-limiter (e.g. halves of one take rendered with
+    suspended state); concatenation therefore matches one continuous raw
+    render before the safety limiter.
+    """
+    if first.sample_rate != second.sample_rate:
+        raise ValueError("sample rates must match")
+    samples = np.concatenate([first.samples, second.samples], axis=0)
+    sr = first.sample_rate
+    pre_peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+    stats = RenderStats(
+        duration=len(samples) / sr,
+        sample_rate=sr,
+        pre_limiter_peak=pre_peak,
+        post_limiter_peak=pre_peak,
+        max_gain_reduction_db=0.0,
+        limited=False,
+        emitter_peaks={**first.stats.emitter_peaks, **second.stats.emitter_peaks},
+    )
+    return RenderResult(samples=samples, sample_rate=sr, stats=stats)
