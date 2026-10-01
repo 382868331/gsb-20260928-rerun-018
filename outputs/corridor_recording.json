@@ -1,0 +1,178 @@
+{
+  "duration": 8.0,
+  "sample_rate": 48000,
+  "listener_forward": [
+    -1.0,
+    0.0,
+    0.0
+  ],
+  "listener_trajectory": [
+    [
+      0.0,
+      10.5,
+      3.0,
+      0.0
+    ],
+    [
+      8.0,
+      11.5,
+      4.0,
+      0.0
+    ]
+  ],
+  "scene": {
+    "rooms": [
+      {
+        "name": "corridor",
+        "min": [
+          -2.0,
+          -1.0,
+          -2.0
+        ],
+        "max": [
+          14.0,
+          1.0,
+          2.0
+        ],
+        "reverb_time": 0.5,
+        "reverb_send": 0.2
+      },
+      {
+        "name": "room1",
+        "min": [
+          2.0,
+          1.0,
+          -2.0
+        ],
+        "max": [
+          7.0,
+          6.0,
+          2.0
+        ],
+        "reverb_time": 0.8,
+        "reverb_send": 0.3
+      },
+      {
+        "name": "room2",
+        "min": [
+          8.0,
+          1.0,
+          -2.0
+        ],
+        "max": [
+          13.0,
+          6.0,
+          2.0
+        ],
+        "reverb_time": 0.9,
+        "reverb_send": 0.3
+      }
+    ],
+    "portals": [
+      {
+        "name": "door1",
+        "rooms": [
+          "corridor",
+          "room1"
+        ],
+        "motion": [
+          [
+            0.0,
+            0.0
+          ],
+          [
+            1.0,
+            0.0
+          ],
+          [
+            2.0,
+            1.0
+          ]
+        ],
+        "position": [
+          4.5,
+          1.0,
+          0.0
+        ]
+      },
+      {
+        "name": "door2",
+        "rooms": [
+          "corridor",
+          "room2"
+        ],
+        "motion": [
+          [
+            0.0,
+            0.0
+          ],
+          [
+            4.0,
+            0.0
+          ],
+          [
+            5.0,
+            1.0
+          ]
+        ],
+        "position": [
+          10.5,
+          1.0,
+          0.0
+        ]
+      },
+      {
+        "name": "door3",
+        "rooms": [
+          "room1",
+          "room2"
+        ],
+        "motion": [
+          [
+            0.0,
+            1.0
+          ]
+        ],
+        "position": [
+          7.5,
+          3.5,
+          0.0
+        ]
+      }
+    ],
+    "zones": []
+  },
+  "emitters": [
+    {
+      "name": "walker",
+      "kind": "tone",
+      "params": {
+        "frequency": 500.0,
+        "duration": 8.0,
+        "fade": 0.01
+      },
+      "trajectory": [
+        [
+          0.0,
+          -1.0,
+          0.0,
+          0.0
+        ],
+        [
+          7.0,
+          13.0,
+          0.0,
+          0.0
+        ]
+      ],
+      "volume": 1.0,
+      "loop": false,
+      "events": [
+        [
+          6.5,
+          false
+        ]
+      ]
+    }
+  ]
+}

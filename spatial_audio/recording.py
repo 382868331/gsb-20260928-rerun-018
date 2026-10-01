@@ -66,9 +66,7 @@ class MotionRecording:
             json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)
 
     @classmethod
-    def load(cls, path):
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+    def from_dict(cls, data):
         lt = Trajectory.from_list(data["listener_trajectory"]) if data.get("listener_trajectory") else None
         specs = [
             EmitterSpec(
@@ -88,6 +86,24 @@ class MotionRecording:
                    data.get("listener_forward", (0.0, 1.0, 0.0)), specs,
                    scene=scene)
 
+    @classmethod
+    def load(cls, path):
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return cls.from_dict(data)
+
+    def with_scene(self, scene):
+        """Copy of this recording with a different room/door arrangement.
+
+        Trajectories, tones and events are shared unchanged, so the same
+        motion take can be replayed under another door schedule or with
+        added absorption zones.
+        """
+        return MotionRecording(
+            self.duration, self.sample_rate, self.listener_trajectory,
+            self.listener_forward, self.emitters, scene=scene,
+        )
+
 
 def _build_resource(kind, params, sample_rate):
     if kind == "tone":
@@ -101,13 +117,13 @@ def _build_resource(kind, params, sample_rate):
     raise ValueError(f"unsupported resource kind: {kind}")
 
 
-def build_engine(recording: MotionRecording) -> SpatialEngine:
+def build_engine(recording: MotionRecording, scene=None) -> SpatialEngine:
     listener = Listener(forward=recording.listener_forward,
                         trajectory=recording.listener_trajectory)
     if recording.listener_trajectory is not None:
         listener.position = recording.listener_trajectory.points[0]
     engine = SpatialEngine(listener, sample_rate=recording.sample_rate,
-                           scene=recording.scene)
+                           scene=scene if scene is not None else recording.scene)
     for spec in recording.emitters:
         resource = _build_resource(spec.kind, spec.params, recording.sample_rate)
         initially_active = True
@@ -128,6 +144,38 @@ def build_engine(recording: MotionRecording) -> SpatialEngine:
     return engine
 
 
-def render_recording(recording: MotionRecording, block_size: int = 1024) -> RenderResult:
-    engine = build_engine(recording)
+def render_recording(recording: MotionRecording, block_size: int = 1024,
+                     scene=None) -> RenderResult:
+    """Render a recording; `scene` overrides the stored door arrangement."""
+    engine = build_engine(recording, scene=scene)
     return engine.render(recording.duration, block_size=block_size)
+
+
+def save_checkpoint(recording: MotionRecording, engine: SpatialEngine, path):
+    """Save recording + full engine state so listening can resume later.
+
+    The snapshot keeps the room scheme, trajectories, event schedule and
+    every decaying reverb tail exactly as they are at engine time
+    `engine._clock`.
+    """
+    data = {
+        "recording": recording.to_dict(),
+        "state": engine.get_state(),
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+
+def load_checkpoint(path):
+    """Load a checkpoint -> (recording, engine) ready for render_chunk().
+
+    The engine clock and all carried state are restored, so continuing
+    with render_chunk() produces exactly the samples that would have
+    followed in the original session.
+    """
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    recording = MotionRecording.from_dict(data["recording"])
+    engine = build_engine(recording)
+    engine.set_state(data["state"])
+    return recording, engine

@@ -81,9 +81,11 @@
             4.5,
             1.0
           ]
-        ]
+        ],
+        "position": null
       }
-    ]
+    ],
+    "zones": []
   },
   "emitters": [
     {

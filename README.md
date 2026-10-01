@@ -19,6 +19,7 @@
   房间的门，DoorMotion 关键帧描述开度随时间变化，smoothstep 插值保证连续）、
   RoomScene（回答直达/混响透射查询）、RoomReverb（反馈梳状 + 全通滤波器组，
   状态跨块延续，尾音与分块大小无关）。
+  AbsorptionZone（轴对齐吸声区域）只衰减几何路径穿过该区域的传播。
 
 ## 关键保证
 
@@ -34,6 +35,25 @@
 - 遮挡与门：声源与听者不在同一房间时，直达声按门开度连续衰减并经固定低通
   交叉淡化（频谱随门开度连续变化）；门关闭后直达声明显受阻，但源房间的
   混响尾音仍按较低的透射增益传入，可清晰分辨。
+- 多房间与绕行路径：RoomScene 在门户图上枚举两房间之间的所有简单路径
+  （直达 + 绕行），每条路径增益为沿途各门透射的乘积，各路径能量相加
+  （上限 1）。走廊–房间1–房间2 串联时，关闭直达门后绕行路径仍然可闻，
+  与"路径完全消失"（NO_PATH 级别）明显可区分；远端房间的混响尾音也按
+  最强门户路径继续传入并随时间衰减。
+- 吸声改造对比：AbsorptionZone 只作用于几何路径（听者↔门户↔声源折线）
+  穿过该区域的传播——增益乘以 zone.gain 并增加额外低通混合；不穿过的
+  路径逐采样不变，因此不会让所有房间统一变小声。门关闭（路径消失 +
+  混响透射同时被压）与吸声增强（仅过区路径被衰减、室内尾音保留）在
+  输出上可明确区分。
+- 一次记录、多种重放：MotionRecording 保存轨迹/音调/开关事件与房间方案；
+  render_recording(..., scene=...) 或 recording.with_scene(scene) 可用
+  同一行走记录重放不同的门安排或加吸声区域的方案。
+- 中途保存与续听：engine.render_chunk 推进会话时钟；save_checkpoint 把
+  记录与全部延续状态（播放头、包络、滤波器与混响尾音状态）存入 JSON，
+  load_checkpoint 恢复后继续 render_chunk，与不间断渲染逐采样一致
+  （当时仍在衰减的余音被完整保留）。
+- 区间截取一致：engine.render_interval(t0, t1) 先快进到 t0 再渲染，
+  结果与整段渲染的 [t0, t1] 切片逐采样一致。
 - 混响：每个房间一条立体声混响总线（梳状 + 全通，lfilter zi 跨块延续），
   声源按所在房间发送；听者听到的混响增益同样随门开度连续变化。
 - 状态独立：每个声源的播放头、包络、滤波器状态各自独立，启动/停止某个
@@ -54,6 +74,14 @@
 - outputs/room_recording.json / demo_rooms.wav / demo_rooms_replay.wav /
   room_check.png — 双房间 + 门场景：门在 2 s 关闭、4.5 s  reopen，
   5 s 声源停止后仍可听到隔壁房间的混响尾音。
+- outputs/corridor_recording.json / corridor_walk.wav — 走廊 + 两个相连
+  房间：声源沿走廊行进，door2 关闭期间声音经 room1 绕行进入 room2。
+- outputs/corridor_alt_doors.wav — 同一行走记录换一套门安排重放。
+- outputs/absorb_*_plain.wav / absorb_*_treated.wav / corridor_check.png —
+  吸声改造对比：同一记录在 room2 与走廊两个收听位置、原墙面与新增
+  吸声区域两种方案下的声音与停止后的衰减。
+- outputs/corridor_checkpoint.json / corridor_resumed.wav — 中途保存的
+  检查点及续听结果（与整段渲染对应区间差异约 1e-12）。
 
 测试：
 

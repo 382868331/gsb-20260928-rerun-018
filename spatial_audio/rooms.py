@@ -75,6 +75,10 @@ class Room:
         self.reverb_time = float(reverb_time)
         self.reverb_send = float(reverb_send)
 
+    @property
+    def center(self):
+        return 0.5 * (self.min + self.max)
+
     def mask(self, positions):
         """Boolean mask of points (n, 3) lying inside this room."""
         p = np.asarray(positions, dtype=np.float64)
@@ -98,11 +102,12 @@ class Room:
 class Portal:
     """A door connecting two rooms; openness varies with DoorMotion."""
 
-    def __init__(self, name, room_a, room_b, motion=None):
+    def __init__(self, name, room_a, room_b, motion=None, position=None):
         self.name = str(name)
         self.room_a = str(room_a)
         self.room_b = str(room_b)
         self.motion = motion if motion is not None else DoorMotion()
+        self.position = None if position is None else np.asarray(position, dtype=np.float64)
 
     def connects(self, a, b):
         return {a, b} == {self.room_a, self.room_b}
@@ -112,12 +117,75 @@ class Portal:
             "name": self.name,
             "rooms": [self.room_a, self.room_b],
             "motion": self.motion.to_list(),
+            "position": None if self.position is None else self.position.tolist(),
         }
 
     @classmethod
     def from_dict(cls, d):
         return cls(d["name"], d["rooms"][0], d["rooms"][1],
-                   DoorMotion.from_list(d.get("motion", [[0.0, 1.0]])))
+                   DoorMotion.from_list(d.get("motion", [[0.0, 1.0]])),
+                   position=d.get("position"))
+
+
+class AbsorptionZone:
+    """Axis-aligned sound-absorbing region (e.g. a treated wall area).
+
+    A zone only affects propagation whose geometric path crosses it: the
+    path gain is multiplied by gain and the path picks up extra muffling.
+    Paths that do not cross the zone are exactly as loud as without the
+    treatment, so the effect stays local instead of making every room
+    uniformly quieter.
+    """
+
+    def __init__(self, name, min_corner, max_corner, gain=0.4, muffle=0.3):
+        self.name = str(name)
+        self.min = np.asarray(min_corner, dtype=np.float64)
+        self.max = np.asarray(max_corner, dtype=np.float64)
+        if self.min.shape != (3,) or self.max.shape != (3,) or np.any(self.min >= self.max):
+            raise ValueError("zone corners must be length-3 with min < max")
+        self.gain = float(gain)
+        self.muffle = float(np.clip(muffle, 0.0, 1.0))
+
+    def segments_cross(self, a, b):
+        """Boolean (n,) mask: does segment a[i] -> b[i] intersect this zone?
+
+        a and b are (n, 3) arrays (broadcastable). Slab test per segment.
+        """
+        a, b = np.broadcast_arrays(
+            np.atleast_2d(np.asarray(a, dtype=np.float64)),
+            np.atleast_2d(np.asarray(b, dtype=np.float64)),
+        )
+        d = b - a
+        t_enter = np.full(a.shape[0], -np.inf)
+        t_exit = np.full(a.shape[0], np.inf)
+        for axis in range(3):
+            da = d[:, axis]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                t0 = (self.min[axis] - a[:, axis]) / da
+                t1 = (self.max[axis] - a[:, axis]) / da
+            lo = np.minimum(t0, t1)
+            hi = np.maximum(t0, t1)
+            still = np.abs(da) < 1e-12
+            # Parallel to the slab: inside -> no constraint, outside -> miss.
+            lo = np.where(still, np.where(a[:, axis] >= self.min[axis], -np.inf, np.inf), lo)
+            hi = np.where(still, np.where(a[:, axis] <= self.max[axis], np.inf, -np.inf), hi)
+            t_enter = np.maximum(t_enter, lo)
+            t_exit = np.minimum(t_exit, hi)
+        return (t_enter <= t_exit) & (t_exit >= 0.0) & (t_enter <= 1.0)
+
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "min": self.min.tolist(),
+            "max": self.max.tolist(),
+            "gain": self.gain,
+            "muffle": self.muffle,
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(d["name"], d["min"], d["max"],
+                   d.get("gain", 0.4), d.get("muffle", 0.3))
 
 
 class RoomScene:
@@ -132,10 +200,75 @@ class RoomScene:
     REVERB_CLOSED_GAIN = 0.3
     REVERB_NO_PATH_GAIN = 0.05
 
-    def __init__(self, rooms, portals=()):
+    def __init__(self, rooms, portals=(), zones=()):
         self.rooms = list(rooms)
         self.portals = list(portals)
+        self.zones = list(zones)
         self._index = {r.name: i for i, r in enumerate(self.rooms)}
+
+    def _portal_position(self, portal):
+        """Door position: explicit, else midpoint of the two room centers."""
+        if portal.position is not None:
+            return portal.position
+        a = self.rooms[self._index[portal.room_a]].center
+        b = self.rooms[self._index[portal.room_b]].center
+        return 0.5 * (a + b)
+
+    def _simple_paths(self, idx_a, idx_b, max_paths=8):
+        """All simple portal-graph paths between two room indices.
+
+        Each path is a list of portals. With one hop it is the direct
+        route; longer paths are detours around closed/missing doors.
+        """
+        adj = {i: [] for i in range(len(self.rooms))}
+        for portal in self.portals:
+            ia = self._index.get(portal.room_a)
+            ib = self._index.get(portal.room_b)
+            if ia is None or ib is None:
+                continue
+            adj[ia].append((ib, portal))
+            adj[ib].append((ia, portal))
+        paths = []
+
+        def dfs(node, visited, acc):
+            if len(paths) >= max_paths:
+                return
+            if node == idx_b:
+                paths.append(list(acc))
+                return
+            for nxt, portal in adj.get(node, ()): 
+                if nxt in visited:
+                    continue
+                visited.add(nxt)
+                acc.append(portal)
+                dfs(nxt, visited, acc)
+                acc.pop()
+                visited.discard(nxt)
+
+        if idx_a in adj and idx_b in adj:
+            dfs(idx_a, {idx_a}, [])
+        paths.sort(key=len)
+        return paths
+
+    def _zone_factors(self, waypoints):
+        """Per-sample (gain, muffle) absorbed by zones along a polyline.
+
+        waypoints: list of (n, 3) or (3,) arrays from listener to source
+        through door positions. Only segments crossing a zone are damped.
+        """
+        if not self.zones:
+            return None, None
+        pts = [np.atleast_2d(np.asarray(w, dtype=np.float64)) for w in waypoints]
+        n = max(len(p) for p in pts)
+        gain = np.ones(n)
+        muffle = np.zeros(n)
+        for zone in self.zones:
+            hit = np.zeros(n, dtype=bool)
+            for a, b in zip(pts[:-1], pts[1:]):
+                hit |= zone.segments_cross(a, b)
+            gain = np.where(hit, gain * zone.gain, gain)
+            muffle = np.where(hit, 1.0 - (1.0 - muffle) * (1.0 - zone.muffle), muffle)
+        return gain, muffle
 
     def room_index_at(self, positions):
         """Room index per point (n, 3); -1 when outside every room."""
@@ -148,58 +281,112 @@ class RoomScene:
             unset[m] = False
         return idx
 
-    def direct_transmission(self, listener_idx, source_idx, times):
-        """Per-sample (gain, muffle_mix) for the direct path.
+    def direct_transmission(self, listener_idx, source_idx, times,
+                            listener_pos=None, source_pos=None):
+        """Per-sample (gain, muffle_mix) for the direct + detour paths.
+
+        Every simple portal-graph path between the listener room and the
+        source room contributes: each path's gain is the product of its
+        doors' transmission, and path gains add (capped at 1). A closed
+        door on the direct route therefore still lets a detour through
+        other rooms be heard, distinctly from having no path at all.
 
         muffle_mix in [0, 1] crossfades to a fixed lowpassed copy of the
         signal, so the spectrum changes continuously with door motion.
+        Absorption zones only damp paths whose geometry crosses them.
         """
         n = len(times)
         gain = np.ones(n)
         mix = np.zeros(n)
         diff = listener_idx != source_idx
-        if diff.any():
-            gain[diff] = self.DIRECT_NO_PATH_GAIN
-            mix[diff] = 1.0
-            for portal in self.portals:
-                ia = self._index.get(portal.room_a, -2)
-                ib = self._index.get(portal.room_b, -2)
-                m = diff & (
-                    ((listener_idx == ia) & (source_idx == ib))
-                    | ((listener_idx == ib) & (source_idx == ia))
-                )
-                if m.any():
-                    op = portal.motion.open_fraction(times[m])
-                    gain[m] = self.DIRECT_CLOSED_GAIN + (1.0 - self.DIRECT_CLOSED_GAIN) * op
-                    mix[m] = 1.0 - op
+        if not diff.any():
+            if self.zones and listener_pos is not None and source_pos is not None:
+                zg, zm = self._zone_factors([source_pos, listener_pos])
+                gain = gain * zg
+                mix = zm
+            return gain, mix
+
+        gain[diff] = self.DIRECT_NO_PATH_GAIN
+        mix[diff] = 1.0
+        pairs = set(zip(listener_idx[diff].tolist(), source_idx[diff].tolist()))
+        for li, si in pairs:
+            m = diff & (listener_idx == li) & (source_idx == si)
+            if li < 0 or si < 0:
+                continue
+            paths = self._simple_paths(li, si)
+            if not paths:
+                continue
+            g_sum = np.zeros(m.sum())
+            g_weighted_mix = np.zeros(m.sum())
+            for path in paths:
+                open_prod = np.ones(m.sum())
+                for portal in path:
+                    open_prod = open_prod * portal.motion.open_fraction(times[m])
+                g_path = self.DIRECT_CLOSED_GAIN ** len(path) + (
+                    (1.0 - self.DIRECT_CLOSED_GAIN) ** len(path)
+                ) * open_prod
+                mix_path = 1.0 - open_prod
+                if self.zones and listener_pos is not None and source_pos is not None:
+                    waypoints = [listener_pos[m]] + [
+                        self._portal_position(portal) for portal in path
+                    ] + [source_pos[m]]
+                    zg, zm = self._zone_factors(waypoints)
+                    g_path = g_path * zg
+                    mix_path = 1.0 - (1.0 - mix_path) * (1.0 - zm)
+                g_sum += g_path
+                g_weighted_mix += g_path * mix_path
+            total = np.minimum(g_sum, 1.0)
+            gain[m] = np.maximum(total, self.DIRECT_NO_PATH_GAIN)
+            mix[m] = np.where(
+                g_sum > 1e-12, g_weighted_mix / np.maximum(g_sum, 1e-12), 1.0
+            )
         return gain, mix
 
-    def reverb_transmission(self, listener_idx, room_i, times):
-        """Per-sample gain at which room_i's reverb reaches the listener."""
+    def reverb_transmission(self, listener_idx, room_i, times, listener_pos=None):
+        """Per-sample gain at which room_i's reverb reaches the listener.
+
+        Multi-hop rooms contribute along their strongest portal path, so a
+        far room's tail is still audible (fainter) through open doors.
+        """
         n = len(times)
         gain = np.full(n, self.REVERB_NO_PATH_GAIN)
         same = listener_idx == room_i
         gain[same] = 1.0
         rest = ~same
-        if rest.any():
-            for portal in self.portals:
-                ia = self._index.get(portal.room_a, -2)
-                ib = self._index.get(portal.room_b, -2)
-                if room_i == ia:
-                    m = rest & (listener_idx == ib)
-                elif room_i == ib:
-                    m = rest & (listener_idx == ia)
-                else:
-                    continue
-                if m.any():
-                    op = portal.motion.open_fraction(times[m])
-                    gain[m] = self.REVERB_CLOSED_GAIN + (1.0 - self.REVERB_CLOSED_GAIN) * op
+        if not rest.any():
+            return gain
+        if room_i < 0:
+            return gain
+        for li in set(listener_idx[rest].tolist()):
+            m = rest & (listener_idx == li)
+            if li < 0:
+                continue
+            paths = self._simple_paths(li, room_i)
+            if not paths:
+                continue
+            best = np.zeros(m.sum())
+            for path in paths:
+                open_prod = np.ones(m.sum())
+                for portal in path:
+                    open_prod = open_prod * portal.motion.open_fraction(times[m])
+                g_path = self.REVERB_CLOSED_GAIN ** len(path) + (
+                    (1.0 - self.REVERB_CLOSED_GAIN) ** len(path)
+                ) * open_prod
+                if self.zones and listener_pos is not None:
+                    waypoints = [listener_pos[m]] + [
+                        self._portal_position(portal) for portal in path
+                    ] + [self.rooms[room_i].center]
+                    zg, _ = self._zone_factors(waypoints)
+                    g_path = g_path * zg
+                best = np.maximum(best, g_path)
+            gain[m] = np.maximum(best, self.REVERB_NO_PATH_GAIN)
         return gain
 
     def to_dict(self):
         return {
             "rooms": [r.to_dict() for r in self.rooms],
             "portals": [p.to_dict() for p in self.portals],
+            "zones": [z.to_dict() for z in self.zones],
         }
 
     @classmethod
@@ -207,6 +394,7 @@ class RoomScene:
         return cls(
             [Room.from_dict(r) for r in d.get("rooms", [])],
             [Portal.from_dict(p) for p in d.get("portals", [])],
+            [AbsorptionZone.from_dict(z) for z in d.get("zones", [])],
         )
 
 
@@ -262,3 +450,22 @@ class RoomReverb:
             out[:, ch] = y
         return out
 
+    def get_state(self):
+        """JSON-friendly snapshot of every carried filter state."""
+        return [
+            {
+                "combs": [zi.tolist() for _, _, zi in combs],
+                "allpasses": [zi.tolist() for _, _, zi in allpasses],
+            }
+            for combs, allpasses in self._channels
+        ]
+
+    def set_state(self, state):
+        """Restore a snapshot from get_state (tail keeps decaying)."""
+        for ch_state, (combs, allpasses) in zip(state, self._channels):
+            for i, zi in enumerate(ch_state["combs"]):
+                b, a, _ = combs[i]
+                combs[i] = (b, a, np.asarray(zi, dtype=np.float64))
+            for i, zi in enumerate(ch_state["allpasses"]):
+                b, a, _ = allpasses[i]
+                allpasses[i] = (b, a, np.asarray(zi, dtype=np.float64))
