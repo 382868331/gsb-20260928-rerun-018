@@ -21,6 +21,40 @@ from scipy.signal import lfilter
 from .scene import Emitter, Listener
 from .rooms import RoomReverb
 
+
+def _one_pole_lowpass(cutoff, sample_rate):
+    """First-order one-pole lowpass coefficients used as band crossovers."""
+    a0 = float(1.0 - np.exp(-2.0 * np.pi * cutoff / sample_rate))
+    return [a0], [1.0, -(1.0 - a0)]
+
+
+def split_bands(signal, edges_b_a_states):
+    """Complementary band split; bands sum back to ``signal`` exactly.
+
+    ``edges_b_a_states`` is a list, one per ascending crossover edge, of
+    ``(b, a, state)`` where ``state`` is the carried one-pole state.
+    Each lowpass peels the lower frequencies off the remaining signal;
+    the final band is whatever is left, so the decomposition introduces
+    no overall colouration when all band gains are 1. Works for mono
+    signals (state length 1) or stereo (n, 2) with independent channels.
+    """
+    bands = []
+    residual = signal
+    for b, a, state in edges_b_a_states:
+        axis = 0 if residual.ndim == 2 else -1
+        stereo = residual.ndim == 2
+        z0 = np.atleast_1d(np.asarray(state, dtype=np.float64))
+        zi = z0[None, :].copy() if stereo else [float(z0[0])]
+        low, zf = lfilter(b, a, residual, zi=zi, axis=axis)
+        if stereo:
+            state[:] = np.asarray(zf[0], dtype=np.float64)
+        else:
+            state[0] = float(zf[0])
+        bands.append(low)
+        residual = residual - low
+    bands.append(residual)
+    return bands
+
 SPEED_OF_SOUND = 343.0
 
 
@@ -57,6 +91,12 @@ class _EmitterRuntime:
         self.finished = False
         self.lp_state = 0.0     # occlusion lowpass filter state
         self.occl_state = 0.0   # smoothed occlusion (muffle) mix
+        # Per-band smoothed absorption gains for the direct/detour path.
+        self.band_states = None
+        self.send_band_states = None
+        # Carried crossover lowpass states for the complementary band split.
+        self.xover_states = None
+        self.send_xover_states = None
 
 
 def _resample(resource_samples, playhead, rates, loop):
@@ -122,9 +162,24 @@ class SpatialEngine:
                 for room in scene.rooms
             ]
             self._reverb_gain_states = [0.0] * len(scene.rooms)
+            self._band_edges = [
+                _one_pole_lowpass(float(fc), self.sample_rate)
+                for fc in scene.band_edges
+            ]
+            self._nbands = len(scene.band_edges) + 1
+            self._reverb_band_states = [
+                np.zeros(self._nbands) for _ in scene.rooms
+            ]
+            self._wet_xover_states = [
+                [np.zeros(2) for _ in scene.band_edges] for _ in scene.rooms
+            ]
         else:
             self._reverbs = []
             self._reverb_gain_states = []
+            self._band_edges = []
+            self._nbands = 1
+            self._reverb_band_states = []
+            self._wet_xover_states = []
         self.emitters = []
         self._runtimes = {}
         # emitter id -> list of (time, active), sample-accurate scheduling
@@ -248,8 +303,6 @@ class SpatialEngine:
                 trans, muffle = scene.direct_transmission(
                     listener_rooms, source_rooms, times, lpos, epos
                 )
-                gain_l = gain_l * trans
-                gain_r = gain_r * trans
                 # Muffled copy through a fixed lowpass; the smoothed mix
                 # crossfades dry/muffled so the spectrum moves continuously.
                 muffled, lp_zf = lfilter(
@@ -260,7 +313,48 @@ class SpatialEngine:
                     sb, sa, muffle, zi=[rt.occl_state]
                 )
                 rt.occl_state = float(oc_zf[0])
-                src = src * (1.0 - mix_s) + muffled * mix_s
+                door_src = src * (1.0 - mix_s) + muffled * mix_s
+
+                nbands = self._nbands
+                if rt.band_states is None:
+                    rt.band_states = np.zeros(nbands)
+                    rt.send_band_states = np.zeros(nbands)
+                    rt.xover_states = [[0.0] for _ in self._band_edges]
+                    rt.send_xover_states = [[0.0] for _ in self._band_edges]
+
+                # Direct + detour propagation: split into complementary
+                # frequency bands and apply each band's own door/zone gain.
+                # Bands sum back to door_src when every gain is 1, so the
+                # old broadband absorption setup keeps working unchanged.
+                edges = [
+                    (b, a, rt.xover_states[i])
+                    for i, (b, a) in enumerate(self._band_edges)
+                ]
+                bands = split_bands(door_src, edges)
+                # One one-pole smoother per band, vectorised into one call.
+                g_smooth, zf = lfilter(
+                    sb, sa, trans, zi=rt.band_states[None, :], axis=0
+                )
+                rt.band_states = zf[0].copy()
+                shaped = sum(b * g for b, g in zip(bands, g_smooth.T))
+
+                # Keyframed material changes colour the wet send at
+                # emission time only; a tail sent before the change keeps
+                # the spectrum it actually propagated with.
+                send_trans, _ = scene.send_absorption(source_rooms, times, epos)
+                send_edges = [
+                    (b, a, rt.send_xover_states[i])
+                    for i, (b, a) in enumerate(self._band_edges)
+                ]
+                send_bands = split_bands(door_src, send_edges)
+                sg, szf = lfilter(
+                    sb, sa, send_trans,
+                    zi=rt.send_band_states[None, :], axis=0,
+                )
+                rt.send_band_states = szf[0].copy()
+                wet_send = sum(b * g for b, g in zip(send_bands, sg.T))
+
+                src = shaped
 
             gl_s, zi = lfilter(sb, sa, gain_l, zi=[rt.gain_l_state])
             rt.gain_l_state = float(zi[0])
@@ -270,7 +364,11 @@ class SpatialEngine:
             gate = self._gate(emitter, rt, time_seconds, times)
 
             if scene is not None:
-                send_base = src * gate * dist_gain * emitter.volume
+                # Wet send uses the emission-time band-coloured signal.
+                # Dynamic materials are folded in here (old tails keep
+                # their spectrum); static zones apply on the listener
+                # side through reverb_transmission instead.
+                send_base = wet_send * gate * dist_gain * emitter.volume
                 for ri, room in enumerate(scene.rooms):
                     m = source_rooms == ri
                     if m.any():
@@ -292,11 +390,21 @@ class SpatialEngine:
                 target = scene.reverb_transmission(
                     listener_rooms, ri, times, lpos
                 )
-                g, zi = lfilter(
-                    sb, sa, target, zi=[self._reverb_gain_states[ri]]
+                wet_out = np.zeros_like(wet)
+                edges = [
+                    (b, a, self._wet_xover_states[ri][i])
+                    for i, (b, a) in enumerate(self._band_edges)
+                ]
+                wbands = split_bands(wet, edges)
+                # Broadcast each per-channel band by its per-sample gain.
+                g_smooth, zf = lfilter(
+                    sb, sa, target, zi=self._reverb_band_states[ri][None, :],
+                    axis=0,
                 )
-                self._reverb_gain_states[ri] = float(zi[0])
-                mixed += wet * g[:, None]
+                self._reverb_band_states[ri] = zf[0].copy()
+                for band, g in zip(wbands, g_smooth.T):
+                    wet_out += band * g[:, None]
+                mixed += wet_out
         return mixed, peaks
 
     def _limit(self, stereo):
@@ -388,6 +496,17 @@ class SpatialEngine:
                     "gain_r_state": rt.gain_r_state,
                     "lp_state": rt.lp_state,
                     "occl_state": rt.occl_state,
+                    "band_states": (
+                        None if rt.band_states is None else rt.band_states.tolist()
+                    ),
+                    "send_band_states": (
+                        None if rt.send_band_states is None
+                        else rt.send_band_states.tolist()
+                    ),
+                    "xover_states": [s[0] for s in (rt.xover_states or [])],
+                    "send_xover_states": [
+                        s[0] for s in (rt.send_xover_states or [])
+                    ],
                     "finished": rt.finished,
                 }
                 for e in self.emitters
@@ -395,6 +514,11 @@ class SpatialEngine:
             },
             "reverbs": [rv.get_state() for rv in self._reverbs],
             "reverb_gain_states": list(self._reverb_gain_states),
+            "reverb_band_states": [s.tolist() for s in self._reverb_band_states],
+            "wet_xover_states": [
+                [[v for v in st] for st in states]
+                for states in self._wet_xover_states
+            ],
         }
 
     def set_state(self, state):
@@ -411,10 +535,31 @@ class SpatialEngine:
             rt.gain_r_state = float(es["gain_r_state"])
             rt.lp_state = float(es["lp_state"])
             rt.occl_state = float(es["occl_state"])
+            bs = es.get("band_states")
+            rt.band_states = None if bs is None else np.asarray(bs, dtype=np.float64)
+            sbs = es.get("send_band_states")
+            rt.send_band_states = (
+                None if sbs is None else np.asarray(sbs, dtype=np.float64)
+            )
+            xs = es.get("xover_states", [])
+            rt.xover_states = [[float(v)] for v in xs]
+            sxs = es.get("send_xover_states", [])
+            rt.send_xover_states = [[float(v)] for v in sxs]
             rt.finished = bool(es["finished"])
         for rv, rv_state in zip(self._reverbs, state.get("reverbs", [])):
             rv.set_state(rv_state)
         gains = state.get("reverb_gain_states")
         if gains is not None:
             self._reverb_gain_states = [float(g) for g in gains]
+        rbs = state.get("reverb_band_states")
+        if rbs is not None:
+            self._reverb_band_states = [
+                np.asarray(s, dtype=np.float64) for s in rbs
+            ]
+        wxs = state.get("wet_xover_states")
+        if wxs is not None:
+            self._wet_xover_states = [
+                [np.asarray(st, dtype=np.float64) for st in states]
+                for states in wxs
+            ]
         self._clock = float(state.get("clock", 0.0))

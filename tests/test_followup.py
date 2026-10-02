@@ -22,6 +22,21 @@ from spatial_audio import (
 )
 from spatial_audio.recording import EmitterSpec, build_engine
 
+
+def _multiband_tone(freqs=(200.0, 1200.0, 4000.0), duration=2.0):
+    """Signal carrying several frequencies at once (multi-band checks)."""
+    t = np.arange(int(duration * SR)) / SR
+    samples = sum(np.sin(2.0 * np.pi * f * t) for f in freqs) / len(freqs)
+    return SoundResource(samples, SR)
+
+
+def _band_energy(stereo, freq, halfwidth=60.0, t0=0.4, t1=1.5):
+    seg = stereo[int(t0 * SR):int(t1 * SR), 0] + stereo[int(t0 * SR):int(t1 * SR), 1]
+    win = np.hanning(len(seg))
+    spec = np.abs(np.fft.rfft(seg * win)) ** 2
+    freqs = np.fft.rfftfreq(len(seg), 1.0 / SR)
+    return float(np.sum(spec[(freqs >= freq - halfwidth) & (freqs < freq + halfwidth)]))
+
 SR = 48000
 
 
@@ -272,3 +287,170 @@ def test_zones_survive_recording_round_trip(tmp_path):
         render_recording(loaded, block_size=1024).samples,
         atol=1e-12,
     )
+
+
+# ---------------------------------------------------------------------------
+# Frequency-band-aware materials, mid-replay changes and path tracing
+# ---------------------------------------------------------------------------
+
+def _band_scene(band_gains=None):
+    rooms = [
+        Room("a", (-5.0, -5.0, -2.0), (0.0, 5.0, 2.0), reverb_time=0.5),
+        Room("b", (0.0, -5.0, -2.0), (5.0, 5.0, 2.0), reverb_time=0.5),
+    ]
+    portals = [Portal("door", "a", "b", DoorMotion([(0.0, 1.0)]),
+                      position=(0.0, 0.0, 0.0))]
+    # Wide panel straddling the door: every a<->b path crosses it.
+    zone = AbsorptionZone(
+        "panel", (-0.5, -1.0, -2.0), (4.5, 1.0, 2.0),
+        band_gains=band_gains or {"low": 1.0, "mid": 0.5, "high": 0.2},
+    )
+    return RoomScene(rooms, portals, [zone])
+
+
+def _render_multi(scene, duration=1.8, source=(2.5, 0.0, 0.0)):
+    listener = Listener(position=(-2.0, 0.0, 0.0), forward=(1.0, 0.0, 0.0))
+    engine = SpatialEngine(listener, sample_rate=SR, scene=scene)
+    engine.add_emitter(Emitter("src", _multiband_tone(duration=duration),
+                               position=source))
+    return engine.render(duration, block_size=512).samples
+
+
+def test_zone_affects_bands_independently():
+    plain = _render_multi(RoomScene(_band_scene().rooms, _band_scene().portals))
+    treated = _render_multi(_band_scene())
+    r_low = _band_energy(treated, 200) / _band_energy(plain, 200)
+    r_mid = _band_energy(treated, 1200) / _band_energy(plain, 1200)
+    r_high = _band_energy(treated, 4000) / _band_energy(plain, 4000)
+    # Low band essentially preserved; mid and high cut by their own gains.
+    assert r_low > 0.85
+    assert 0.2 < r_mid < 0.8
+    assert r_high < 0.35
+    assert r_low > 1.5 * r_mid > 1.5 * r_high
+
+
+def test_separate_tones_match_band_behaviour():
+    # A single low tone and a single high tone through the same material.
+    def render_tone(freq):
+        listener = Listener(position=(-2.0, 0.0, 0.0), forward=(1.0, 0.0, 0.0))
+        scene = _band_scene()
+        engine = SpatialEngine(listener, sample_rate=SR, scene=scene)
+        engine.add_emitter(Emitter("s", _tone(freq, 1.5), position=(2.5, 0.0, 0.0)))
+        return engine.render(1.5, block_size=512).samples
+    low_in = _rms(render_tone(200.0), 0.4, 1.4)
+    high_in = _rms(render_tone(4000.0), 0.4, 1.4)
+    # Untreated reference.
+    def render_plain(freq):
+        scene = RoomScene(_band_scene().rooms, _band_scene().portals)
+        listener = Listener(position=(-2.0, 0.0, 0.0), forward=(1.0, 0.0, 0.0))
+        engine = SpatialEngine(listener, sample_rate=SR, scene=scene)
+        engine.add_emitter(Emitter("s", _tone(freq, 1.5), position=(2.5, 0.0, 0.0)))
+        return engine.render(1.5, block_size=512).samples
+    low_ref = _rms(render_plain(200.0), 0.4, 1.4)
+    high_ref = _rms(render_plain(4000.0), 0.4, 1.4)
+    assert low_in / low_ref > 0.85
+    assert high_in / high_ref < 0.4
+
+
+def test_changing_material_does_not_recolour_existing_tail():
+    # Source stops at t=0.8; high-absorbing panels are installed at
+    # t=1.2 (while the tail is still decaying). The high-frequency tail
+    # generated before the change must keep the untreated spectrum.
+    def scene():
+        s = _band_scene()
+        zone = s.zones[0]
+        zone.set_schedule("install", [
+            (1.2, {"low": 1.0, "mid": 1.0, "high": 1.0}, 0.0),
+            (1.25, {"low": 1.0, "mid": 0.5, "high": 0.1}, 0.0),
+        ])
+        return s
+
+    def render(sc):
+        listener = Listener(position=(-2.0, 0.0, 0.0), forward=(1.0, 0.0, 0.0))
+        engine = SpatialEngine(listener, sample_rate=SR, scene=sc)
+        e = Emitter("src", _multiband_tone(duration=3.0), position=(2.5, 0.0, 0.0))
+        engine.add_emitter(e)
+        engine.schedule_active(e, 0.8, False)
+        return engine.render(3.0, block_size=512).samples
+
+    untreated = render(RoomScene(scene().rooms, scene().portals))
+    changed = render(scene())
+    # Tail ringing after the change was emitted before it: unchanged.
+    e_old = _band_energy(changed, 4000, t0=1.35, t1=1.7)
+    e_old_ref = _band_energy(untreated, 4000, t0=1.35, t1=1.7)
+    assert e_old > 0.8 * e_old_ref
+
+
+def test_block_size_independent_with_band_zone_and_checkpoint(tmp_path):
+    scene = _band_scene()
+    scene.zones[0].set_schedule("install", [
+        (1.0, {"low": 1.0, "mid": 1.0, "high": 1.0}, 0.0),
+        (1.05, {"low": 1.0, "mid": 0.6, "high": 0.2}, 0.0),
+    ])
+    rec = MotionRecording(
+        duration=3.0,
+        sample_rate=SR,
+        listener_trajectory=Trajectory.linear([(0.0, (-2.0, 0.0, 0.0))]),
+        listener_forward=(1.0, 0.0, 0.0),
+        scene=scene,
+        emitters=[
+            EmitterSpec(
+                name="src",
+                kind="tone",
+                params={"frequency": 520.0, "duration": 3.0, "fade": 0.005},
+                trajectory=Trajectory.linear([(0.0, (2.5, 0.0, 0.0))]),
+                events=[(1.2, False)],
+            )
+        ],
+    )
+    ref = render_recording(rec, block_size=1024).samples
+    for bs in (37, 256, 5000):
+        np.testing.assert_allclose(
+            render_recording(rec, block_size=bs).samples, ref, atol=1e-11
+        )
+    engine = build_engine(rec)
+    first = engine.render_chunk(1.3).samples
+    ckpt = tmp_path / "band_ckpt.json"
+    save_checkpoint(rec, engine, ckpt)
+    _, engine2 = load_checkpoint(ckpt)
+    resumed = engine2.render_chunk(1.7).samples
+    np.testing.assert_allclose(
+        resumed, ref[int(1.3 * SR):], atol=1e-11
+    )
+    assert _rms(resumed, 0.05, 0.5) > 1e-6  # tail preserved across save
+
+
+def test_multiple_zones_compose_and_path_is_traceable():
+    rooms = [
+        Room("a", (-5.0, -5.0, -2.0), (0.0, 5.0, 2.0), reverb_time=0.4),
+        Room("b", (0.0, -5.0, -2.0), (5.0, 5.0, 2.0), reverb_time=0.4),
+    ]
+    portals = [Portal("door", "a", "b", DoorMotion([(0.0, 1.0)]),
+                      position=(0.0, 0.0, 0.0))]
+    z1 = AbsorptionZone("p1", (-0.5, -1.0, -2.0), (1.5, 1.0, 2.0),
+                        band_gains={"low": 1.0, "mid": 0.7, "high": 0.5})
+    z2 = AbsorptionZone("p2", (1.5, -1.0, -2.0), (4.5, 1.0, 2.0),
+                        band_gains={"low": 1.0, "mid": 0.7, "high": 0.5})
+    one = RoomScene(rooms, portals, [z1])
+    two = RoomScene(
+        [Room(r.name, r.min, r.max, r.reverb_time) for r in rooms],
+        portals, [z1, z2],
+    )
+    out_one = _render_multi(one, duration=1.2)
+    out_two = _render_multi(two, duration=1.2)
+    # Two panels in series cut the high band more than a single one.
+    e1 = _band_energy(out_one, 4000, t0=0.4, t1=1.1)
+    e2 = _band_energy(out_two, 4000, t0=0.4, t1=1.1)
+    assert e2 < 0.7 * e1
+    # The low band passes both panels essentially unchanged.
+    l1 = _band_energy(out_one, 200, t0=0.4, t1=1.1)
+    l2 = _band_energy(out_two, 200, t0=0.4, t1=1.1)
+    assert l2 > 0.9 * l1
+
+    # Path trace at a listening moment reports door + both materials.
+    report = two.path_report(
+        np.array([-2.0, 0.0, 0.0]), np.array([2.5, 0.0, 0.0]), t=0.5
+    )
+    assert report[0]["doors"] == ["door"]
+    assert [z["name"] for z in report[0]["zones"]] == ["p1", "p2"]
+    assert abs(report[0]["band_gains"]["high"] - 0.25) < 1e-12
