@@ -15,10 +15,16 @@
 - spatial_audio/engine.py — SpatialEngine：核心渲染。
 - spatial_audio/recording.py — MotionRecording：把运动轨迹、音调参数、开关事件
   存为 JSON，可重建场景并重放，导出结果可复现。
+  render_interval(...) 只渲染选定区间，结果与整段渲染后截取完全一致；
+  save_session/load_session 在中途保存/恢复整个引擎状态（含仍在衰减的
+  混响尾音），重开后从断点继续听。
 - spatial_audio/rooms.py — Room（轴对齐房间盒 + 混响参数）、Portal（连接两个
   房间的门，DoorMotion 关键帧描述开度随时间变化，smoothstep 插值保证连续）、
-  RoomScene（回答直达/混响透射查询）、RoomReverb（反馈梳状 + 全通滤波器组，
-  状态跨块延续，尾音与分块大小无关）。
+  RoomScene（房间-门构成图，直达声沿所有简单门路径求和：近路被关门切断时
+  绕行路径仍在传声；混响透射同样多跳传播）、AbsorptionZone（吸声区域，
+  只衰减几何上穿过该区域的传播路径，纯增益、不改变频谱，与关门造成的
+  低通闷化可区分）、RoomReverb（反馈梳状 + 全通滤波器组，状态跨块延续，
+  尾音与分块大小无关，可整体快照/恢复）。
 
 ## 关键保证
 
@@ -34,6 +40,15 @@
 - 遮挡与门：声源与听者不在同一房间时，直达声按门开度连续衰减并经固定低通
   交叉淡化（频谱随门开度连续变化）；门关闭后直达声明显受阻，但源房间的
   混响尾音仍按较低的透射增益传入，可清晰分辨。
+- 多房间路径：走廊与多个相连房间构成门图，直达声为各条门路径增益之和
+  （每条路径增益为沿途各门透射的乘积），门逐渐开合时直达与绕行声各自
+  连续变化；已产生的余音继续在各自房间衰减并沿可用路径传到听者。
+- 吸声改造：AbsorptionZone 只影响穿过它的传播（直达线段、听者到房间中心
+  的混响路径），不经过的路径逐采样不变，不会让全场统一变小声。
+- 断点续听：engine.snapshot()/restore_state() 捕获播放头、包络、滤波器与
+  每个房间混响的滤波器状态；save_session 把房间方案、轨迹与状态一起存成
+  JSON，load_session 恢复后 render(..., start_time=t) 与一次性整段渲染
+  逐采样一致（误差约 1e-12）。
 - 混响：每个房间一条立体声混响总线（梳状 + 全通，lfilter zi 跨块延续），
   声源按所在房间发送；听者听到的混响增益同样随门开度连续变化。
 - 状态独立：每个声源的播放头、包络、滤波器状态各自独立，启动/停止某个
@@ -54,6 +69,16 @@
 - outputs/room_recording.json / demo_rooms.wav / demo_rooms_replay.wav /
   room_check.png — 双房间 + 门场景：门在 2 s 关闭、4.5 s  reopen，
   5 s 声源停止后仍可听到隔壁房间的混响尾音。
+- outputs/corridor_recording.json / demo_corridor.wav — 走廊 + 三房间
+  （含绕行环路）行走记录：door_b 在 2.5-3.5 s 逐渐关闭，直达路径消失后
+  绕行路径（经 room3）继续传声，8 s 声源停止后余音继续衰减。
+- outputs/corridor_replay_alt_doors.wav — 同一条行走记录换一套门安排
+  （door_b 常开、door_c 常闭）重放的结果。
+- outputs/corridor_session.json / corridor_resumed.wav — 5 s 处保存会话，
+  重开后接着渲染，与整段渲染一致。
+- outputs/corridor_treated.wav / absorption_compare.png — 同一条记录分别
+  采用原墙面与新增吸声区域，在两个收听位置的电平对比及声源停止后的
+  衰减曲线。
 
 测试：
 

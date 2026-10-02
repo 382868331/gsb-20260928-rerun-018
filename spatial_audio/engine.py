@@ -243,7 +243,8 @@ class SpatialEngine:
             if scene is not None:
                 source_rooms = scene.room_index_at(epos)
                 trans, muffle = scene.direct_transmission(
-                    listener_rooms, source_rooms, times
+                    listener_rooms, source_rooms, times,
+                    listener_pos=lpos, source_pos=epos,
                 )
                 gain_l = gain_l * trans
                 gain_r = gain_r * trans
@@ -286,7 +287,9 @@ class SpatialEngine:
         if scene is not None:
             for ri, room in enumerate(scene.rooms):
                 wet = self._reverbs[ri].process(room_inputs[ri])
-                target = scene.reverb_transmission(listener_rooms, ri, times)
+                target = scene.reverb_transmission(
+                    listener_rooms, ri, times, listener_pos=lpos
+                )
                 g, zi = lfilter(
                     sb, sa, target, zi=[self._reverb_gain_states[ri]]
                 )
@@ -308,12 +311,61 @@ class SpatialEngine:
         reduction = float(np.max(np.abs(stereo) - np.abs(limited))) if stereo.size else 0.0
         return limited, reduction
 
-    def render(self, duration, block_size=1024):
-        """Render duration seconds; block_size never changes the result."""
+    def snapshot(self):
+        """Capture all carried state so rendering can resume later.
+
+        Includes per-emitter playheads/envelopes/filter states and every
+        room reverb's filter state, so tails that are still decaying at
+        snapshot time continue to decay after restore. Combine with
+        restore_state() on an engine built from the same scene.
+        """
+        return {
+            "emitters": {
+                rt.emitter.name: {
+                    "playhead": rt.playhead,
+                    "env_state": rt.env_state,
+                    "gain_l_state": rt.gain_l_state,
+                    "gain_r_state": rt.gain_r_state,
+                    "lp_state": rt.lp_state,
+                    "occl_state": rt.occl_state,
+                    "finished": rt.finished,
+                }
+                for rt in self._runtimes.values()
+            },
+            "reverb_gain_states": list(self._reverb_gain_states),
+            "reverbs": [r.get_state() for r in self._reverbs],
+        }
+
+    def restore_state(self, state):
+        """Restore a snapshot produced by snapshot()."""
+        by_name = {e.name: e for e in self.emitters}
+        for name, es in state.get("emitters", {}).items():
+            emitter = by_name.get(name)
+            if emitter is None:
+                continue
+            rt = self._runtimes[id(emitter)]
+            rt.playhead = float(es["playhead"])
+            rt.env_state = float(es["env_state"])
+            rt.gain_l_state = float(es["gain_l_state"])
+            rt.gain_r_state = float(es["gain_r_state"])
+            rt.lp_state = float(es["lp_state"])
+            rt.occl_state = float(es["occl_state"])
+            rt.finished = bool(es["finished"])
+        gains = state.get("reverb_gain_states", [])
+        self._reverb_gain_states = [float(g) for g in gains]
+        for reverb, rstate in zip(self._reverbs, state.get("reverbs", [])):
+            reverb.set_state(rstate)
+
+    def render(self, duration, block_size=1024, start_time=0.0):
+        """Render duration seconds; block_size never changes the result.
+
+        start_time sets the continuous time of the first sample, so a
+        restored engine can continue exactly where a snapshot was taken.
+        """
         n_total = int(round(duration * self.sample_rate))
         chunks = []
         emitter_peaks = {}
-        pos, t0 = 0, 0.0
+        pos, t0 = 0, float(start_time)
         while pos < n_total:
             n = min(int(block_size), n_total - pos)
             block, peaks = self.render_block(t0, n)

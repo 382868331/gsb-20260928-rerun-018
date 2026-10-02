@@ -15,8 +15,14 @@ from .resources import SoundResource
 from .trajectory import Trajectory, Waypoint
 from .scene import Emitter, Listener
 from .engine import SpatialEngine, RenderResult
-from .recording import MotionRecording, render_recording
-from .rooms import DoorMotion, Portal, Room, RoomScene
+from .recording import (
+    MotionRecording,
+    load_session,
+    render_interval,
+    render_recording,
+    save_session,
+)
+from .rooms import AbsorptionZone, DoorMotion, Portal, Room, RoomScene
 
 __all__ = [
     "SoundResource",
@@ -28,6 +34,10 @@ __all__ = [
     "RenderResult",
     "MotionRecording",
     "render_recording",
+    "render_interval",
+    "save_session",
+    "load_session",
+    "AbsorptionZone",
     "DoorMotion",
     "Portal",
     "Room",
