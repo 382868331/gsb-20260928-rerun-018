@@ -135,9 +135,18 @@ class AbsorptionZone:
     Paths that do not cross the zone are exactly as loud as without the
     treatment, so the effect stays local instead of making every room
     uniformly quieter.
+
+    Frequency-band treatment: pass bands with one entry per scene band
+    (see RoomScene.band_edges). Each entry is either a constant gain or a
+    keyframe list [(time, gain), ...] interpolated like a DoorMotion, so a
+    material can be swapped mid-replay. A zone with bands applies those
+    per-band gains instead of the scalar gain/muffle on the direct path
+    and on the reverb send, letting one material kill high frequencies
+    while leaving lows almost untouched.
     """
 
-    def __init__(self, name, min_corner, max_corner, gain=0.4, muffle=0.3):
+    def __init__(self, name, min_corner, max_corner, gain=0.4, muffle=0.3,
+                 bands=None):
         self.name = str(name)
         self.min = np.asarray(min_corner, dtype=np.float64)
         self.max = np.asarray(max_corner, dtype=np.float64)
@@ -145,6 +154,26 @@ class AbsorptionZone:
             raise ValueError("zone corners must be length-3 with min < max")
         self.gain = float(gain)
         self.muffle = float(np.clip(muffle, 0.0, 1.0))
+        if bands is None:
+            self.bands = None
+        else:
+            self.bands = [
+                DoorMotion([(0.0, float(entry))]) if np.isscalar(entry)
+                else DoorMotion(entry)
+                for entry in bands
+            ]
+
+    def band_gains_at(self, times):
+        """Per-band gain at scalar/array time -> (n_bands,) or (n, n_bands).
+
+        Returns None for a purely broadband (scalar) zone.
+        """
+        if self.bands is None:
+            return None
+        scalar = np.isscalar(times)
+        tv = np.atleast_1d(np.asarray(times, dtype=np.float64))
+        out = np.stack([m.open_fraction(tv) for m in self.bands], axis=1)
+        return out[0] if scalar else out
 
     def segments_cross(self, a, b):
         """Boolean (n,) mask: does segment a[i] -> b[i] intersect this zone?
@@ -174,18 +203,22 @@ class AbsorptionZone:
         return (t_enter <= t_exit) & (t_exit >= 0.0) & (t_enter <= 1.0)
 
     def to_dict(self):
-        return {
+        d = {
             "name": self.name,
             "min": self.min.tolist(),
             "max": self.max.tolist(),
             "gain": self.gain,
             "muffle": self.muffle,
         }
+        if self.bands is not None:
+            d["bands"] = [m.to_list() for m in self.bands]
+        return d
 
     @classmethod
     def from_dict(cls, d):
         return cls(d["name"], d["min"], d["max"],
-                   d.get("gain", 0.4), d.get("muffle", 0.3))
+                   d.get("gain", 0.4), d.get("muffle", 0.3),
+                   bands=d.get("bands"))
 
 
 class RoomScene:
@@ -200,11 +233,31 @@ class RoomScene:
     REVERB_CLOSED_GAIN = 0.3
     REVERB_NO_PATH_GAIN = 0.05
 
-    def __init__(self, rooms, portals=(), zones=()):
+    def __init__(self, rooms, portals=(), zones=(), band_edges=(1000.0,)):
         self.rooms = list(rooms)
         self.portals = list(portals)
         self.zones = list(zones)
         self._index = {r.name: i for i, r in enumerate(self.rooms)}
+        edges = tuple(float(e) for e in band_edges)
+        if any(e <= 0.0 for e in edges) or tuple(sorted(edges)) != edges:
+            raise ValueError("band_edges must be positive and sorted")
+        self.band_edges = edges
+        for zone in self.zones:
+            if zone.bands is not None and len(zone.bands) != self.n_bands:
+                raise ValueError(
+                    f"zone {zone.name!r} has {len(zone.bands)} band gains but "
+                    f"the scene defines {self.n_bands} bands"
+                )
+
+    @property
+    def n_bands(self):
+        """Number of frequency bands: len(band_edges) + 1."""
+        return len(self.band_edges) + 1
+
+    @property
+    def has_band_zones(self):
+        """True when any zone carries per-band (frequency-dependent) gains."""
+        return any(z.bands is not None for z in self.zones)
 
     def _portal_position(self, portal):
         """Door position: explicit, else midpoint of the two room centers."""
@@ -255,6 +308,8 @@ class RoomScene:
 
         waypoints: list of (n, 3) or (3,) arrays from listener to source
         through door positions. Only segments crossing a zone are damped.
+        Zones with per-band gains are skipped here; their effect is
+        applied per frequency band by zone_band_factors instead.
         """
         if not self.zones:
             return None, None
@@ -263,12 +318,37 @@ class RoomScene:
         gain = np.ones(n)
         muffle = np.zeros(n)
         for zone in self.zones:
+            if zone.bands is not None:
+                continue
             hit = np.zeros(n, dtype=bool)
             for a, b in zip(pts[:-1], pts[1:]):
                 hit |= zone.segments_cross(a, b)
             gain = np.where(hit, gain * zone.gain, gain)
             muffle = np.where(hit, 1.0 - (1.0 - muffle) * (1.0 - zone.muffle), muffle)
         return gain, muffle
+
+    def zone_band_factors(self, waypoints, times):
+        """Per-sample, per-band gain absorbed by band zones along a polyline.
+
+        Returns an (n, n_bands) array, or None when no zone defines
+        per-band gains. Segments crossing several band zones multiply
+        their per-band gains, so passing two panels differs from one.
+        """
+        if not self.has_band_zones:
+            return None
+        pts = [np.atleast_2d(np.asarray(w, dtype=np.float64)) for w in waypoints]
+        n = max(len(p) for p in pts)
+        times = np.broadcast_to(np.asarray(times, dtype=np.float64), (n,))
+        factors = np.ones((n, self.n_bands))
+        for zone in self.zones:
+            if zone.bands is None:
+                continue
+            hit = np.zeros(n, dtype=bool)
+            for a, b in zip(pts[:-1], pts[1:]):
+                hit |= zone.segments_cross(a, b)
+            gains = zone.band_gains_at(times)
+            factors = np.where(hit[:, None], factors * gains, factors)
+        return factors
 
     def room_index_at(self, positions):
         """Room index per point (n, 3); -1 when outside every room."""
@@ -342,6 +422,145 @@ class RoomScene:
             )
         return gain, mix
 
+    def direct_zone_bands(self, listener_idx, source_idx, times,
+                          listener_pos, source_pos):
+        """Per-sample, per-band extra gain from band zones on direct paths.
+
+        Mirrors direct_transmission: every portal-graph path contributes
+        its own band factor (product of the per-band gains of the zones it
+        crosses), weighted by that path's scalar door gain. Returns an
+        (n, n_bands) array, or None when no zone has per-band gains.
+        """
+        if not self.has_band_zones:
+            return None
+        n = len(times)
+        out = np.ones((n, self.n_bands))
+        diff = listener_idx != source_idx
+        same = ~diff
+        if same.any():
+            bf = self.zone_band_factors(
+                [source_pos[same], listener_pos[same]], times[same]
+            )
+            out[same] = bf
+        if not diff.any():
+            return out
+        pairs = set(zip(listener_idx[diff].tolist(), source_idx[diff].tolist()))
+        for li, si in pairs:
+            m = diff & (listener_idx == li) & (source_idx == si)
+            if li < 0 or si < 0:
+                continue
+            paths = self._simple_paths(li, si)
+            if not paths:
+                continue
+            g_sum = np.zeros(m.sum())
+            b_sum = np.zeros((m.sum(), self.n_bands))
+            for path in paths:
+                open_prod = np.ones(m.sum())
+                for portal in path:
+                    open_prod = open_prod * portal.motion.open_fraction(times[m])
+                g_path = self.DIRECT_CLOSED_GAIN ** len(path) + (
+                    (1.0 - self.DIRECT_CLOSED_GAIN) ** len(path)
+                ) * open_prod
+                waypoints = [listener_pos[m]] + [
+                    self._portal_position(portal) for portal in path
+                ] + [source_pos[m]]
+                bf = self.zone_band_factors(waypoints, times[m])
+                g_sum += g_path
+                b_sum += g_path[:, None] * bf
+            out[m] = np.where(
+                g_sum[:, None] > 1e-12,
+                b_sum / np.maximum(g_sum, 1e-12)[:, None],
+                1.0,
+            )
+        return out
+
+    def send_band_factors(self, source_pos, source_idx, times):
+        """Per-sample, per-band zone gain for the reverb send of a source.
+
+        Applied where the sound enters its room's reverb bus, so a tail
+        already decaying keeps the spectrum of the materials that were in
+        place when it was produced; swapping a material later only colors
+        newly generated sound. Returns (n, n_bands) or None.
+        """
+        if not self.has_band_zones:
+            return None
+        n = len(times)
+        out = np.ones((n, self.n_bands))
+        centers = np.zeros((n, 3))
+        valid = np.zeros(n, dtype=bool)
+        for ri, room in enumerate(self.rooms):
+            m = source_idx == ri
+            if m.any():
+                centers[m] = room.center
+                valid[m] = True
+        if valid.any():
+            bf = self.zone_band_factors(
+                [source_pos[valid], centers[valid]], times[valid]
+            )
+            out[valid] = bf
+        return out
+
+    def explain_path(self, listener_pos, source_pos, time):
+        """Dominant propagation path at one listen moment, with materials.
+
+        Returns a dict naming the strongest portal route between the
+        listener and the source at the given time, each door's open
+        fraction, every absorption zone the route crosses (with its
+        per-band gains at that moment) and the resulting scalar and
+        per-band path gains. Lets a user trace why a moment sounds the
+        way it does.
+        """
+        lp = np.asarray(listener_pos, dtype=np.float64)
+        sp = np.asarray(source_pos, dtype=np.float64)
+        t = float(time)
+        li = int(self.room_index_at([lp])[0])
+        si = int(self.room_index_at([sp])[0])
+        room_name = lambda i: self.rooms[i].name if 0 <= i < len(self.rooms) else None
+        candidates = []
+        if li == si:
+            candidates.append((1.0, []))
+        elif li >= 0 and si >= 0:
+            for path in self._simple_paths(li, si):
+                open_prod = 1.0
+                for portal in path:
+                    open_prod *= portal.motion.open_fraction(t)
+                g = self.DIRECT_CLOSED_GAIN ** len(path) + (
+                    (1.0 - self.DIRECT_CLOSED_GAIN) ** len(path)
+                ) * open_prod
+                candidates.append((g, path))
+        score, best = max(candidates, key=lambda c: c[0]) if candidates else (0.0, [])
+        waypoints = [lp] + [self._portal_position(p) for p in best] + [sp]
+        zones_hit = []
+        band_gains = np.ones(self.n_bands)
+        any_band = False
+        for zone in self.zones:
+            crossed = False
+            for a, b in zip(waypoints[:-1], waypoints[1:]):
+                if bool(zone.segments_cross(a, b)[0]):
+                    crossed = True
+                    break
+            if not crossed:
+                continue
+            entry = {"name": zone.name, "gain": zone.gain}
+            bg = zone.band_gains_at(t)
+            if bg is not None:
+                entry["bands"] = [float(v) for v in bg]
+                band_gains *= np.asarray(bg, dtype=np.float64)
+                any_band = True
+            zones_hit.append(entry)
+        return {
+            "time": t,
+            "listener_room": room_name(li),
+            "source_room": room_name(si),
+            "portals": [
+                {"name": p.name, "open": float(p.motion.open_fraction(t))}
+                for p in best
+            ],
+            "zones": zones_hit,
+            "path_gain": float(score),
+            "band_gains": [float(v) for v in band_gains] if any_band else None,
+        }
+
     def reverb_transmission(self, listener_idx, room_i, times, listener_pos=None):
         """Per-sample gain at which room_i's reverb reaches the listener.
 
@@ -387,6 +606,7 @@ class RoomScene:
             "rooms": [r.to_dict() for r in self.rooms],
             "portals": [p.to_dict() for p in self.portals],
             "zones": [z.to_dict() for z in self.zones],
+            "band_edges": list(self.band_edges),
         }
 
     @classmethod
@@ -395,6 +615,7 @@ class RoomScene:
             [Room.from_dict(r) for r in d.get("rooms", [])],
             [Portal.from_dict(p) for p in d.get("portals", [])],
             [AbsorptionZone.from_dict(z) for z in d.get("zones", [])],
+            band_edges=d.get("band_edges", (1000.0,)),
         )
 
 

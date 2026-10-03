@@ -57,6 +57,28 @@ class _EmitterRuntime:
         self.finished = False
         self.lp_state = 0.0     # occlusion lowpass filter state
         self.occl_state = 0.0   # smoothed occlusion (muffle) mix
+        # Per-crossover lowpass states for frequency-band splitting of the
+        # direct path and of the reverb send (lazily sized to the scene).
+        self.direct_band_states = None
+        self.send_band_states = None
+
+
+def _split_bands(x, filters, states):
+    """Split mono x into len(filters)+1 complementary bands.
+
+    Each stage lowpasses the residual of the previous stage, so the bands
+    sum back to the input. states carries one zi float per stage across
+    blocks, keeping the split sample-exact for any block size.
+    """
+    bands = []
+    rest = x
+    for k, (b, a) in enumerate(filters):
+        low, zf = lfilter(b, a, rest, zi=[states[k]])
+        states[k] = float(zf[0])
+        bands.append(low)
+        rest = rest - low
+    bands.append(rest)
+    return bands
 
 
 def _resample(resource_samples, playhead, rates, loop):
@@ -122,9 +144,16 @@ class SpatialEngine:
                 for room in scene.rooms
             ]
             self._reverb_gain_states = [0.0] * len(scene.rooms)
+            # One-pole crossovers splitting the signal into the scene
+            # frequency bands (only used when a zone has per-band gains).
+            self._band_filters = []
+            for edge in scene.band_edges:
+                a0 = float(1.0 - np.exp(-2.0 * np.pi * edge / self.sample_rate))
+                self._band_filters.append(([a0], [1.0, -(1.0 - a0)]))
         else:
             self._reverbs = []
             self._reverb_gain_states = []
+            self._band_filters = []
         self.emitters = []
         self._runtimes = {}
         # emitter id -> list of (time, active), sample-accurate scheduling
@@ -262,6 +291,22 @@ class SpatialEngine:
                 rt.occl_state = float(oc_zf[0])
                 src = src * (1.0 - mix_s) + muffled * mix_s
 
+            direct_src = src
+            if scene is not None and scene.has_band_zones:
+                # Frequency-dependent absorption: split into bands and
+                # weigh each by the zones the direct paths cross. Sound
+                # produced now uses the materials in place now; tails
+                # already inside the reverb buses are untouched.
+                if rt.direct_band_states is None:
+                    rt.direct_band_states = [0.0] * len(self._band_filters)
+                mult = scene.direct_zone_bands(
+                    listener_rooms, source_rooms, times, lpos, epos
+                )
+                bands = _split_bands(src, self._band_filters, rt.direct_band_states)
+                direct_src = np.zeros_like(src)
+                for bi, band in enumerate(bands):
+                    direct_src += band * mult[:, bi]
+
             gl_s, zi = lfilter(sb, sa, gain_l, zi=[rt.gain_l_state])
             rt.gain_l_state = float(zi[0])
             gr_s, zi = lfilter(sb, sa, gain_r, zi=[rt.gain_r_state])
@@ -271,13 +316,28 @@ class SpatialEngine:
 
             if scene is not None:
                 send_base = src * gate * dist_gain * emitter.volume
+                if scene.has_band_zones:
+                    # Band-filter the send where it enters the room bus,
+                    # so a decaying tail keeps the spectrum of the
+                    # materials present when it was produced.
+                    if rt.send_band_states is None:
+                        rt.send_band_states = [0.0] * len(self._band_filters)
+                    send_mult = scene.send_band_factors(
+                        epos, source_rooms, times
+                    )
+                    send_bands = _split_bands(
+                        send_base, self._band_filters, rt.send_band_states
+                    )
+                    send_base = np.zeros_like(send_base)
+                    for bi, band in enumerate(send_bands):
+                        send_base += band * send_mult[:, bi]
                 for ri, room in enumerate(scene.rooms):
                     m = source_rooms == ri
                     if m.any():
                         room_inputs[ri][m] += send_base[m] * room.reverb_send
 
-            ch_l = src * gl_s * gate
-            ch_r = src * gr_s * gate
+            ch_l = direct_src * gl_s * gate
+            ch_r = direct_src * gr_s * gate
             mixed[:, 0] += ch_l
             mixed[:, 1] += ch_r
             peaks[emitter.name] = max(
@@ -389,6 +449,8 @@ class SpatialEngine:
                     "lp_state": rt.lp_state,
                     "occl_state": rt.occl_state,
                     "finished": rt.finished,
+                    "direct_band_states": rt.direct_band_states,
+                    "send_band_states": rt.send_band_states,
                 }
                 for e in self.emitters
                 for rt in [self._runtimes[id(e)]]
@@ -412,6 +474,12 @@ class SpatialEngine:
             rt.lp_state = float(es["lp_state"])
             rt.occl_state = float(es["occl_state"])
             rt.finished = bool(es["finished"])
+            dbs = es.get("direct_band_states")
+            rt.direct_band_states = (
+                None if dbs is None else [float(v) for v in dbs])
+            sbs = es.get("send_band_states")
+            rt.send_band_states = (
+                None if sbs is None else [float(v) for v in sbs])
         for rv, rv_state in zip(self._reverbs, state.get("reverbs", [])):
             rv.set_state(rv_state)
         gains = state.get("reverb_gain_states")

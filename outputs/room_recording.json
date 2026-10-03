@@ -85,7 +85,10 @@
         "position": null
       }
     ],
-    "zones": []
+    "zones": [],
+    "band_edges": [
+      1000.0
+    ]
   },
   "emitters": [
     {

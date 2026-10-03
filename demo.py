@@ -413,6 +413,100 @@ def demo_corridor():
     print("corridor/detour/checkpoint/interval checks passed.")
 
 
+def _band_split(samples, edge=1000.0):
+    """Analysis helper: complementary one-pole low/high split."""
+    a0 = 1.0 - np.exp(-2.0 * np.pi * edge / SR)
+    from scipy.signal import lfilter
+    low = np.empty_like(samples)
+    for ch in range(2):
+        low[:, ch] = lfilter([a0], [1.0, -(1.0 - a0)], samples[:, ch])
+    return low, samples - low
+
+
+def demo_bands():
+    """Frequency-band absorption: same walk take, band-selective panels."""
+    # Two walkers on the same corridor path: a 500 Hz tone (low band) and
+    # a 4 kHz tone (high band), so each band can be checked separately.
+    recording = build_corridor_recording()
+    walk = Trajectory.linear(
+        [(0.0, (-1.0, 0.0, 0.0)), (7.0, (13.0, 0.0, 0.0))]
+    )
+    recording.emitters = [
+        EmitterSpec(
+            name="walker_low",
+            kind="tone",
+            params={"frequency": 500.0, "duration": CORRIDOR_DURATION,
+                    "fade": 0.01},
+            trajectory=walk,
+            events=[(6.5, False)],
+        ),
+        EmitterSpec(
+            name="walker_high",
+            kind="tone",
+            params={"frequency": 4000.0, "duration": CORRIDOR_DURATION,
+                    "fade": 0.01},
+            trajectory=walk,
+            events=[(6.5, False)],
+        ),
+    ]
+    base_rec = _static_listener_recording(recording, (10.5, 3.0, 0.0))
+    plain = render_recording(base_rec, block_size=1024)
+
+    # Panels in room1 that keep the low band but absorb the high band.
+    band_scene = build_corridor_scene()
+    band_scene.zones.append(
+        AbsorptionZone("hf_panels", (6.5, 2.5, -2.0), (7.5, 4.5, 2.0),
+                       bands=[0.9, 0.15])
+    )
+    treated = render_recording(base_rec, block_size=1024, scene=band_scene)
+
+    # Same panels, but the high-band material is swapped open at t=5:
+    # sound produced earlier keeps the dull treatment, later sound clears.
+    swap_scene = build_corridor_scene()
+    swap_scene.zones.append(
+        AbsorptionZone("swap_panels", (6.5, 2.5, -2.0), (7.5, 4.5, 2.0),
+                       bands=[0.9, [(0.0, 0.15), (5.0, 0.15), (6.0, 0.9)]])
+    )
+    swapped = render_recording(base_rec, block_size=1024, scene=swap_scene)
+
+    sf.write(OUT / "band_room2_plain.wav", plain.samples, SR, subtype="PCM_16")
+    sf.write(OUT / "band_room2_treated.wav", treated.samples, SR, subtype="PCM_16")
+    sf.write(OUT / "band_room2_swap.wav", swapped.samples, SR, subtype="PCM_16")
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 7), sharex=True)
+    for ax, (title, pick) in zip(axes, [("low band (<1 kHz)", 0),
+                                        ("high band (>1 kHz)", 1)]):
+        for label, res, style in [("original", plain, "-"),
+                                  ("band panels", treated, "--"),
+                                  ("panels swapped at 5 s", swapped, ":")]:
+            low, high = _band_split(res.samples)
+            t, rms = channel_rms(low if pick == 0 else high)
+            ax.plot(t, rms[:, 0], style, label=label)
+        ax.set_ylabel("RMS level")
+        ax.set_title(f"Heard from room2: {title}")
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8)
+    axes[1].set_xlabel("time (s)")
+    fig.tight_layout()
+    fig.savefig(OUT / "band_check.png", dpi=130)
+
+    info = band_scene.explain_path((10.5, 3.0, 0.0), (4.5, 3.0, 0.0), 3.0)
+    print(f"wrote band_room2_*.wav and band_check.png")
+    print(f"path trace at t=3 s: {info}")
+
+    def level(samples, t0, t1):
+        seg = samples[int(t0 * SR):int(t1 * SR)]
+        return float(np.sqrt(np.mean(seg ** 2)))
+    plain_low, plain_high = _band_split(plain.samples)
+    treated_low, treated_high = _band_split(treated.samples)
+    # Detour-heavy window (door2 shut): panels cross the path, so the
+    # high band drops clearly while the low band is mostly kept.
+    assert level(treated_high, 2.5, 3.5) < 0.7 * level(plain_high, 2.5, 3.5)
+    assert level(treated_low, 2.5, 3.5) > 0.6 * level(plain_low, 2.5, 3.5)
+    print("band absorption checks passed.")
+
+
 if __name__ == "__main__":
     main()
     demo_corridor()
+    demo_bands()
