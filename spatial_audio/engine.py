@@ -40,6 +40,7 @@ class RenderResult:
     samples: np.ndarray  # shape (n, 2), float64
     sample_rate: int
     stats: RenderStats
+    mode: str = "historical"
 
     def peak(self):
         return float(np.max(np.abs(self.samples)))
@@ -373,7 +374,8 @@ class SpatialEngine:
         reduction = float(np.max(np.abs(stereo) - np.abs(limited))) if stereo.size else 0.0
         return limited, reduction
 
-    def _render_span(self, start_time, duration, block_size):
+    def _render_span(self, start_time, duration, block_size,
+                     output_mode="historical"):
         """Render [start_time, start_time+duration) on the carried state."""
         n_total = int(round(duration * self.sample_rate))
         chunks = []
@@ -404,7 +406,10 @@ class SpatialEngine:
             limited=max_red > 1e-12,
             emitter_peaks=emitter_peaks,
         )
-        return RenderResult(samples=limited, sample_rate=self.sample_rate, stats=stats)
+        return RenderResult(
+            samples=limited, sample_rate=self.sample_rate, stats=stats,
+            mode=output_mode,
+        )
 
     def render(self, duration, block_size=1024):
         """Render duration seconds from t=0; block_size never changes the result."""
@@ -466,7 +471,10 @@ class SpatialEngine:
             self._render_span(0.0, boundary, block_size)
         if reset_reverbs:
             self.reset_reverb_buses()
-        result = self._render_span(boundary, float(duration), block_size)
+        result = self._render_span(
+            boundary, float(duration), block_size,
+            "recomputed" if reset_reverbs else "historical",
+        )
         self._clock = boundary + float(duration)
         return result
 

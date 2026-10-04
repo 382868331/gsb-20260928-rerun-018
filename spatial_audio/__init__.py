@@ -19,6 +19,7 @@ from .recording import (
     MotionRecording,
     load_checkpoint,
     panel_version_manifest,
+    render_panel_candidate,
     render_recording,
     save_checkpoint,
 )
@@ -43,6 +44,7 @@ __all__ = [
     "MotionRecording",
     "render_recording",
     "panel_version_manifest",
+    "render_panel_candidate",
     "save_checkpoint",
     "load_checkpoint",
     "DoorMotion",

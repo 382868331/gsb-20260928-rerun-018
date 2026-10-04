@@ -68,7 +68,16 @@ Panel 提供有限大小、有朝向、可移动旋转、可按区间修订的�
   SpatialEngine.render_recomputed_from(boundary, duration) 先快进到边界、
   再清空混响尾音总线，供比较“保留历史”与“从边界重算”的听感差别。
   panel_version_manifest(recording) 导出每段实际使用的面板版本、位置、
-  朝向和逐频带增益；explain_path 也会列出当时穿过的面板。
+  朝向和逐频带增益；explain_path 也会列出当时穿过的面板。重叠修订通过
+  Panel.propose_revision() 同时保留为候选，不会由后提交者覆盖先提交者；
+  可用 render_panel_candidate(...) 对整段或子区间做不修改原记录的 A/B
+  试听，再用 adopt_revision(name, start, end) 局部采用 base 或某个候选，
+  withdraw_revision(...) 撤回采用，reselect_revision(...) 重选。清单中的
+  status/candidates/remaining_conflicts 会导出每段实际采用版本与未决冲突。
+  普通输出保留已进入混响总线的尾声来源；render_recomputed_from(...) 或
+  render_panel_candidate(..., recompute_from=...) 明确产生 mode="recomputed"
+  的边界重算输出，与 mode="historical" 区分。未决候选和裁决均随 JSON
+  保存，重开后分块渲染与完整渲染一致。
 - 一次记录、多种重放：MotionRecording 保存轨迹/音调/开关事件与房间方案；
   render_recording(..., scene=...) 或 recording.with_scene(scene) 可用
   同一行走记录重放不同的门安排或加吸声区域的方案。

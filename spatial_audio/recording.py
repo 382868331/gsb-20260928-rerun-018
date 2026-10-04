@@ -7,7 +7,9 @@ replaying reconstructs the exact scene so the exported audio is reproducible.
 from __future__ import annotations
 
 import json
+import copy
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 
@@ -190,14 +192,16 @@ def panel_version_manifest(recording: MotionRecording, start=0.0, end=None,
         "panels": [],
     }
     for panel in used_scene.panels:
-        versions = panel.version_at(times)
+        versions, statuses, candidate_rows = panel.selection_report_at(times)
         positions, headings = panel.pose_at(times)
         gains = panel.band_gains_at(times)
         segments = []
         k = 0
         while k < n:
             j = k + 1
-            while j < n and versions[j] == versions[k]:
+            while (j < n and versions[j] == versions[k]
+                   and statuses[j] == statuses[k]
+                   and list(candidate_rows[j] or []) == list(candidate_rows[k] or [])):
                 j += 1
             segment = {
                 "version": str(versions[k]),
@@ -207,13 +211,43 @@ def panel_version_manifest(recording: MotionRecording, start=0.0, end=None,
                 "time_end": float(times[j - 1]) + 1.0 / sr,
                 "position": [float(v) for v in positions[k]],
                 "heading": float(headings[k]),
+                "status": str(statuses[k]),
+                "candidates": [str(v) for v in (candidate_rows[k] or [])],
+                "remaining_conflict": bool(statuses[k] == "conflict"),
             }
             if gains is not None:
                 segment["band_gains"] = [float(v) for v in gains[k]]
             segments.append(segment)
             k = j
-        manifest["panels"].append({"name": panel.name, "segments": segments})
+        manifest["panels"].append({
+            "name": panel.name,
+            "segments": segments,
+            "remaining_conflicts": panel.overlapping_candidates(start, end),
+        })
     return manifest
+
+
+def render_panel_candidate(recording: MotionRecording, panel_name: str,
+                           candidate_name: str, block_size: int = 1024,
+                           start: Optional[float] = None,
+                           end: Optional[float] = None,
+                           recompute_from: Optional[float] = None):
+    """Render an A/B preview without mutating the saved panel decision.
+
+    The candidate can be tried on a subrange of its interval. By default the
+    returned render keeps history; pass recompute_from to produce the explicit
+    boundary-recomputed comparison output.
+    """
+    scene = copy.deepcopy(recording.scene)
+    panel = next(p for p in scene.panels if p.name == panel_name)
+    panel.adopt_revision(candidate_name, start, end)
+    engine = build_engine(recording, scene=scene)
+    if recompute_from is None:
+        return engine.render(recording.duration, block_size=block_size)
+    duration = recording.duration - float(recompute_from)
+    return engine.render_recomputed_from(
+        recompute_from, duration, block_size=block_size,
+    )
 
 
 def save_checkpoint(recording: MotionRecording, engine: SpatialEngine, path):

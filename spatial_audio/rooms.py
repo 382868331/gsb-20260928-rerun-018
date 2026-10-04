@@ -19,6 +19,8 @@ regardless of how the render is split into blocks.
 
 from __future__ import annotations
 
+import copy
+
 import numpy as np
 from scipy.signal import lfilter
 
@@ -344,7 +346,8 @@ class Panel:
 
     def __init__(self, name, width, height,
                  position_keys=((0.0, (0.0, 0.0, 0.0)),),
-                 heading_keys=((0.0, 0.0),), bands=None, revisions=()):
+                 heading_keys=((0.0, 0.0),), bands=None, revisions=(),
+                 decisions=()):
         self.name = str(name)
         self.width = float(width)
         self.height = float(height)
@@ -363,6 +366,172 @@ class Panel:
             for entry in bands
         ]
         self.revisions = list(revisions)
+        self.decisions = [dict(d) for d in decisions]
+
+    def revision(self, name):
+        if name == "base":
+            return None
+        for revision in self.revisions:
+            if revision.name == name:
+                return revision
+        raise KeyError(f"panel {self.name!r} has no revision {name!r}")
+
+    def propose_revision(self, revision):
+        """Keep a new edit as a candidate without replacing prior choices.
+
+        Overlapping candidates remain available for auditioning. Explicit
+        decisions already covering part of the overlap continue to win.
+        """
+        if revision.name == "base":
+            raise ValueError("base is reserved and cannot be a candidate name")
+        for existing in self.revisions:
+            if existing.name == revision.name:
+                raise ValueError(f"revision {revision.name!r} already exists")
+        self.revisions.append(revision)
+        return revision
+
+    def overlapping_candidates(self, start=None, end=None):
+        """Candidate groups whose intervals overlap and lack a full decision."""
+        events = sorted(
+            {float(r.start) for r in self.revisions} |
+            {float(r.end) for r in self.revisions} |
+            {float(d["start"]) for d in self.decisions} |
+            {float(d["end"]) for d in self.decisions}
+        )
+        groups = []
+        for a, b in zip(events[:-1], events[1:]):
+            if start is not None and b <= float(start):
+                continue
+            if end is not None and a >= float(end):
+                continue
+            names = [r.name for r in self.revisions
+                     if r.start <= a and b <= r.end]
+            if len(names) < 2:
+                continue
+            midpoint = 0.5 * (a + b)
+            resolved = False
+            for decision in self.decisions:
+                if not decision["start"] <= midpoint < decision["end"]:
+                    continue
+                if decision["revision"] == "base" or decision["revision"] in names:
+                    resolved = True
+                    break
+            if not resolved:
+                groups.append({"start": a, "end": b, "candidates": names})
+        return groups
+
+    def remaining_conflicts(self, duration=None):
+        return self.overlapping_candidates(0.0, duration)
+
+    def adopt_revision(self, name, start=None, end=None):
+        """Explicitly choose base or a candidate on a (sub)interval."""
+        revision = None if name == "base" else self.revision(name)
+        if start is None or end is None:
+            if revision is None:
+                raise ValueError("start and end are required to adopt base")
+            start, end = revision.start, revision.end
+        start, end = float(start), float(end)
+        if not start < end:
+            raise ValueError("adoption needs start < end")
+        if revision is not None:
+            start = max(start, revision.start)
+            end = min(end, revision.end)
+            if not start < end:
+                raise ValueError("selected range does not overlap the candidate")
+        self.decisions.append({
+            "revision": str(name), "start": start, "end": end,
+        })
+        return self
+
+    def withdraw_revision(self, name, start=None, end=None):
+        """Withdraw an adoption while retaining the candidate for reselection."""
+        name = str(name)
+        kept = []
+        for decision in self.decisions:
+            if decision["revision"] != name:
+                kept.append(decision)
+                continue
+            if start is None or end is None:
+                continue
+            a, b = float(start), float(end)
+            if decision["start"] < a:
+                kept.append({
+                    "revision": name,
+                    "start": decision["start"],
+                    "end": min(decision["end"], a),
+                })
+            if decision["end"] > b:
+                kept.append({
+                    "revision": name,
+                    "start": max(decision["start"], b),
+                    "end": decision["end"],
+                })
+        self.decisions = [d for d in kept if d["start"] < d["end"]]
+        return self
+
+    def reselect_revision(self, old_name, new_name, start=None, end=None):
+        """Replace an adopted choice on a range, leaving other choices intact."""
+        self.withdraw_revision(old_name, start, end)
+        return self.adopt_revision(new_name, start, end)
+
+    def preview_revision(self, name, start=None, end=None):
+        """Return an independent panel copy for A/B candidate auditioning."""
+        panel = copy.deepcopy(self)
+        panel.adopt_revision(name, start, end)
+        return panel
+
+    def _covering_revisions(self, tv):
+        return [
+            (tv >= revision.start) & (tv < revision.end)
+            for revision in self.revisions
+        ]
+
+    def _selection_at(self, tv):
+        """Return selected revision index, base marker, status and candidates.
+
+        The latest explicit decision wins where one exists. Without a
+        decision, a lone candidate is provisional; overlapping candidates
+        are conflicts and the earliest candidate is retained as the safe
+        provisional render, never silently replaced by a later submission.
+        """
+        n = len(tv)
+        selected = np.full(n, -1, dtype=np.int64)
+        status = np.full(n, "base", dtype=object)
+        candidate_lists = np.full(n, None, dtype=object)
+        covering = self._covering_revisions(tv)
+        candidate_index_lists = [[] for _ in range(n)]
+        for k, mask in enumerate(covering):
+            for i in np.flatnonzero(mask):
+                candidate_index_lists[int(i)].append(k)
+        for i, indices in enumerate(candidate_index_lists):
+            candidate_lists[i] = [self.revisions[k].name for k in indices]
+
+        decided = np.zeros(n, dtype=bool)
+        revision_by_name = {r.name: k for k, r in enumerate(self.revisions)}
+        for decision in self.decisions:
+            mask = (~decided) & (tv >= decision["start"]) & (tv < decision["end"])
+            name = decision["revision"]
+            if name == "base":
+                valid = mask
+                selected[valid] = -1
+            else:
+                k = revision_by_name.get(name)
+                valid = np.zeros(n, dtype=bool) if k is None else mask & covering[k]
+                selected[valid] = k
+            decided |= valid
+            status[valid] = "adopted-base" if name == "base" else "adopted"
+
+        unresolved = ~decided
+        counts = np.array([len(v) for v in candidate_index_lists])
+        lone = unresolved & (counts == 1)
+        conflict = unresolved & (counts > 1)
+        for i in np.flatnonzero(lone):
+            selected[i] = candidate_index_lists[int(i)][0]
+            status[i] = "provisional"
+        for i in np.flatnonzero(conflict):
+            selected[i] = candidate_index_lists[int(i)][0]
+            status[i] = "conflict"
+        return selected, status, candidate_lists
 
     def base_pose_at(self, times):
         """Base (position (n,3), heading (n,)), ignoring interval edits."""
@@ -378,19 +547,31 @@ class Panel:
         return np.stack([m.open_fraction(tv) for m in self.bands], axis=1)
 
     def version_at(self, times):
-        """Active revision name per sample ('base' outside every edit)."""
+        """Rendered revision name per sample ('base' outside every edit)."""
         tv = np.atleast_1d(np.asarray(times, dtype=np.float64))
-        names = np.full(len(tv), "base", dtype=object)
-        for revision in self.revisions:
-            names[(tv >= revision.start) & (tv < revision.end)] = revision.name
-        return names
+        selected, _, _ = self._selection_at(tv)
+        return np.asarray(
+            [self.revisions[i].name if i >= 0 else "base" for i in selected],
+            dtype=object,
+        )
+
+    def selection_report_at(self, times):
+        """Per-sample rendered version, resolution status and candidate names."""
+        tv = np.atleast_1d(np.asarray(times, dtype=np.float64))
+        selected, status, candidates = self._selection_at(tv)
+        versions = np.asarray(
+            [self.revisions[i].name if i >= 0 else "base" for i in selected],
+            dtype=object,
+        )
+        return versions, status, candidates
 
     def pose_at(self, times):
         """Effective (positions, headings) after interval revisions."""
         tv = np.atleast_1d(np.asarray(times, dtype=np.float64))
         pos, head = self.base_pose_at(tv)
-        for revision in self.revisions:
-            mask = (tv >= revision.start) & (tv < revision.end)
+        selected, _, _ = self._selection_at(tv)
+        for k, revision in enumerate(self.revisions):
+            mask = selected == k
             if not mask.any():
                 continue
             rp = revision.sample_positions(tv[mask])
@@ -405,8 +586,9 @@ class Panel:
         """Effective per-band transmission as an (n, n_bands) array."""
         tv = np.atleast_1d(np.asarray(times, dtype=np.float64))
         gains = self.base_band_gains_at(tv)
-        for revision in self.revisions:
-            mask = (tv >= revision.start) & (tv < revision.end)
+        selected, _, _ = self._selection_at(tv)
+        for k, revision in enumerate(self.revisions):
+            mask = selected == k
             if not mask.any() or gains is None:
                 continue
             rg = revision.sample_bands(len(self.bands), tv[mask])
@@ -460,6 +642,7 @@ class Panel:
             "bands": None if self.bands is None
                     else [m.to_list() for m in self.bands],
             "revisions": [r.to_dict() for r in self.revisions],
+            "decisions": self.decisions,
         }
 
     @classmethod
@@ -476,6 +659,7 @@ class Panel:
             bands=d.get("bands"),
             revisions=[PanelRevision.from_dict(r)
                         for r in d.get("revisions", [])],
+            decisions=d.get("decisions", []),
         )
 
 

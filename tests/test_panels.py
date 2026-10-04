@@ -20,6 +20,7 @@ from spatial_audio import (
     Trajectory,
     load_checkpoint,
     panel_version_manifest,
+    render_panel_candidate,
     render_recording,
     save_checkpoint,
 )
@@ -71,6 +72,34 @@ def _panel(moving=False, revised=False):
 def _scene(panel=None):
     return RoomScene([ROOM], band_edges=EDGES,
                      panels=[] if panel is None else [panel])
+
+
+def _conflict_panel():
+    panel = _panel()
+    panel.propose_revision(PanelRevision(
+        "editor_left", 0.8, 2.0,
+        position_keys=[(0.0, PANEL_POS)],
+        bands=[None, None, 0.75],
+    ))
+    panel.propose_revision(PanelRevision(
+        "editor_right", 0.8, 2.0,
+        position_keys=[(0.0, (-1.0, 2.0, 0.0))],
+        bands=[None, None, 0.08],
+    ))
+    return panel
+
+
+def _conflict_recording(duration=2.2, panel=None):
+    return MotionRecording(
+        duration=duration, sample_rate=SR,
+        listener_trajectory=Trajectory.linear([(0.0, LISTEN_A)]),
+        listener_forward=(1.0, 0.0, 0.0),
+        scene=_scene(_conflict_panel() if panel is None else panel),
+        emitters=[EmitterSpec(
+            "src", "tone", {"frequency": HIGH, "duration": duration, "fade": 0.003},
+            Trajectory.linear([(0.0, SOURCE_A)]),
+        )],
+    )
 
 
 def _render(freq, duration=2.5, panel=None, listener=LISTEN_A,
@@ -219,3 +248,93 @@ def test_block_size_pause_resume_interval_and_recording_agree(tmp_path):
     assert stored.name == "mover"
     assert stored.revisions[0].name == "open_high"
     assert len(stored._pos_times) == 3
+
+
+def test_overlapping_editors_remain_candidates_until_partial_choice():
+    rec = _conflict_recording()
+    panel = rec.scene.panels[0]
+
+    full = render_recording(rec, block_size=4096).samples
+    left_preview = render_panel_candidate(
+        rec, "mover", "editor_left", block_size=512,
+    ).samples
+    right_preview = render_panel_candidate(
+        rec, "mover", "editor_right", block_size=512,
+    ).samples
+    assert _rms(right_preview, 1.1, 1.7) > _rms(left_preview, 1.1, 1.7) * 1.4
+
+    panel.adopt_revision("editor_left", 1.0, 1.5)
+    chosen = render_recording(rec, block_size=37).samples
+    manifest = panel_version_manifest(rec)
+    segments = manifest["panels"][0]["segments"]
+    statuses = [(s["version"], s["status"], s["remaining_conflict"]) for s in segments]
+    assert ("editor_left", "adopted", False) in statuses
+    assert any(item[2] for item in statuses)
+    assert manifest["panels"][0]["remaining_conflicts"] == [
+        {"start": 0.8, "end": 1.0, "candidates": ["editor_left", "editor_right"]},
+        {"start": 1.5, "end": 2.0, "candidates": ["editor_left", "editor_right"]},
+    ]
+
+    np.testing.assert_allclose(
+        chosen[int(1.0 * SR):int(1.5 * SR)],
+        left_preview[int(1.0 * SR):int(1.5 * SR)], atol=1e-11,
+    )
+    np.testing.assert_allclose(
+        chosen[int(1.55 * SR):int(1.9 * SR)],
+        full[int(1.55 * SR):int(1.9 * SR)], atol=1e-12,
+    )
+
+
+def test_later_candidate_cannot_replace_previous_partial_decision():
+    panel = _conflict_panel()
+    panel.adopt_revision("editor_left", 1.0, 1.4)
+    panel.propose_revision(PanelRevision(
+        "later", 1.05, 1.35, bands=[None, None, 0.01],
+    ))
+    versions, statuses, candidates = panel.selection_report_at(
+        np.array([1.1, 1.55])
+    )
+    assert versions[0] == "editor_left"
+    assert statuses[0] == "adopted"
+    assert candidates[0] == ["editor_left", "editor_right", "later"]
+    assert versions[1] == "editor_left" and statuses[1] == "conflict"
+
+    panel.reselect_revision("editor_left", "editor_right", 1.1, 1.2)
+    versions, statuses, _ = panel.selection_report_at(np.array([1.05, 1.15, 1.3]))
+    assert list(versions) == ["editor_left", "editor_right", "editor_left"]
+    assert list(statuses) == ["adopted", "adopted", "adopted"]
+    panel.withdraw_revision("editor_right")
+    versions, statuses, _ = panel.selection_report_at(np.array([1.15]))
+    assert versions[0] == "editor_left" and statuses[0] == "conflict"
+
+
+def test_pending_candidates_round_trip_and_history_recompute_are_marked(tmp_path):
+    duration = 1.1
+    rec = _conflict_recording()
+    panel = rec.scene.panels[0]
+    rec.duration = duration
+    rec.emitters[0].params["duration"] = duration
+    panel.adopt_revision("editor_left", 0.82, 0.95)
+    path = tmp_path / "pending.json"
+    rec.save(path)
+    loaded = MotionRecording.load(path)
+    restored_panel = loaded.scene.panels[0]
+    assert restored_panel.decisions == panel.decisions
+    assert [r.name for r in restored_panel.revisions] == [
+        "editor_left", "editor_right",
+    ]
+
+    full = render_recording(loaded, block_size=257).samples
+    for block_size in (37, 64, 4099):
+        np.testing.assert_allclose(
+            render_recording(loaded, block_size=block_size).samples, full, atol=1e-11,
+        )
+
+    historical = render_panel_candidate(loaded, "mover", "editor_right")
+    recomputed = render_panel_candidate(
+        loaded, "mover", "editor_right", recompute_from=0.8,
+    )
+    assert historical.mode == "historical"
+    assert recomputed.mode == "recomputed"
+    assert historical.samples.shape[0] == full.shape[0]
+    assert recomputed.samples.shape[0] == int(0.3 * SR)
