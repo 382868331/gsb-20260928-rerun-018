@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+import numpy as np
+
 from .resources import SoundResource
 from .trajectory import Trajectory
 from .scene import Emitter, Listener
@@ -114,6 +116,20 @@ def _build_resource(kind, params, sample_rate):
             phase=params.get("phase", 0.0),
             fade=params.get("fade", 0.01),
         )
+    if kind == "mix_tones":
+        n = int(round(params["duration"] * sample_rate))
+        tt = np.arange(n) / sample_rate
+        signal = np.zeros(n)
+        for frequency, amplitude in params["tones"]:
+            signal += float(amplitude) * np.sin(2.0 * np.pi * float(frequency) * tt)
+        fade_n = int(round(params.get("fade", 0.01) * sample_rate))
+        if fade_n > 0:
+            ramp = 0.5 - 0.5 * np.cos(
+                np.pi * np.clip(np.arange(fade_n) / max(fade_n - 1, 1), 0.0, 1.0)
+            )
+            signal[:fade_n] *= ramp
+            signal[-fade_n:] *= ramp[::-1]
+        return SoundResource(signal, sample_rate)
     raise ValueError(f"unsupported resource kind: {kind}")
 
 
@@ -149,6 +165,55 @@ def render_recording(recording: MotionRecording, block_size: int = 1024,
     """Render a recording; `scene` overrides the stored door arrangement."""
     engine = build_engine(recording, scene=scene)
     return engine.render(recording.duration, block_size=block_size)
+
+
+def panel_version_manifest(recording: MotionRecording, start=0.0, end=None,
+                           scene=None):
+    """Run-length panel-version trace for every sample in a render span.
+
+    Each segment names the panel version actually used at those sample
+    times ("base" or a PanelRevision name), its placement/heading and the
+    effective per-band transmission. This makes an audible
+    render auditable without inferring geometry from the output audio.
+    """
+    used_scene = scene if scene is not None else recording.scene
+    sr = recording.sample_rate
+    start = float(start)
+    end = float(recording.duration if end is None else end)
+    n = max(0, int(round((end - start) * sr)))
+    times = start + (np.arange(n) + 0.5) / sr
+    manifest = {
+        "sample_rate": sr,
+        "start": start,
+        "end": end,
+        "band_edges": list(used_scene.band_edges),
+        "panels": [],
+    }
+    for panel in used_scene.panels:
+        versions = panel.version_at(times)
+        positions, headings = panel.pose_at(times)
+        gains = panel.band_gains_at(times)
+        segments = []
+        k = 0
+        while k < n:
+            j = k + 1
+            while j < n and versions[j] == versions[k]:
+                j += 1
+            segment = {
+                "version": str(versions[k]),
+                "sample_start": k,
+                "sample_end": j,
+                "time_start": float(times[k]),
+                "time_end": float(times[j - 1]) + 1.0 / sr,
+                "position": [float(v) for v in positions[k]],
+                "heading": float(headings[k]),
+            }
+            if gains is not None:
+                segment["band_gains"] = [float(v) for v in gains[k]]
+            segments.append(segment)
+            k = j
+        manifest["panels"].append({"name": panel.name, "segments": segments})
+    return manifest
 
 
 def save_checkpoint(recording: MotionRecording, engine: SpatialEngine, path):

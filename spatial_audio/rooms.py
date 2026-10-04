@@ -221,6 +221,264 @@ class AbsorptionZone:
                    bands=d.get("bands"))
 
 
+def _smooth_curve(times, values, query):
+    tv = np.atleast_1d(np.asarray(query, dtype=np.float64))
+    times = np.asarray(times, dtype=np.float64)
+    values = np.asarray(values, dtype=np.float64)
+    if len(times) == 1:
+        return np.broadcast_to(values[0], (len(tv), values.shape[1])).copy()
+    idx = np.clip(np.searchsorted(times, tv, side="right") - 1, 0, len(times) - 2)
+    t0, t1 = times[idx], times[idx + 1]
+    v0, v1 = values[idx], values[idx + 1]
+    u = np.clip((tv - t0) / np.maximum(t1 - t0, 1e-12), 0.0, 1.0)
+    s = (u * u * (3.0 - 2.0 * u))[:, None]
+    out = v0 + (v1 - v0) * s
+    out[tv <= times[0]] = values[0]
+    out[tv >= times[-1]] = values[-1]
+    return out
+
+
+class PanelRevision:
+    """A panel edit authoritative only on one explicit time interval.
+
+    Positions/headings are keyed in global scene time and smoothstep
+    interpolated. A band entry of None keeps the base panel transmission
+    for that band; a scalar applies constantly, while keyframed rows are
+    interpolated. Revisions do not touch sound already held in a reverb
+    bus: such a tail keeps the material present when it was produced.
+    """
+
+    def __init__(self, name, start, end, position_keys=None,
+                 heading_keys=None, bands=None):
+        self.name = str(name)
+        self.start = float(start)
+        self.end = float(end)
+        if not self.start < self.end:
+            raise ValueError("revision needs start < end")
+        self.position_keys = position_keys
+        self.heading_keys = heading_keys
+        self.bands = list(bands) if bands is not None else None
+
+    def sample_positions(self, times):
+        if self.position_keys is None:
+            return None
+        rows = sorted((float(t), np.asarray(p, dtype=np.float64))
+                      for t, p in self.position_keys)
+        kt = np.array([t for t, _ in rows])
+        kv = np.stack([p for _, p in rows])
+        return _smooth_curve(kt, kv, times)
+
+    def sample_headings(self, times):
+        if self.heading_keys is None:
+            return None
+        rows = sorted((float(t), float(h)) for t, h in self.heading_keys)
+        kt = np.array([t for t, _ in rows])
+        kv = np.unwrap(np.array([h for _, h in rows]))[:, None]
+        return _smooth_curve(kt, kv, times)[:, 0]
+
+    def sample_bands(self, n_bands, times):
+        if self.bands is None:
+            return None
+        if len(self.bands) != n_bands:
+            raise ValueError(
+                f"revision {self.name!r} has {len(self.bands)} band entries "
+                f"but the panel uses {n_bands} bands"
+            )
+        tv = np.atleast_1d(np.asarray(times, dtype=np.float64))
+        out = np.full((len(tv), n_bands), np.nan)
+        for bi, entry in enumerate(self.bands):
+            if entry is None:
+                continue
+            if np.isscalar(entry):
+                out[:, bi] = float(entry)
+            else:
+                rows = sorted((float(t), float(g)) for t, g in entry)
+                kt = np.array([t for t, _ in rows])
+                kv = np.array([[g] for _, g in rows])
+                out[:, bi] = _smooth_curve(kt, kv, tv)[:, 0]
+        return out
+
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "start": self.start,
+            "end": self.end,
+            "position_keys": (
+                None if self.position_keys is None
+                else [[float(t), *np.asarray(p, dtype=np.float64).tolist()]
+                      for t, p in self.position_keys]
+            ),
+            "heading_keys": (
+                None if self.heading_keys is None
+                else [[float(t), float(h)] for t, h in self.heading_keys]
+            ),
+            "bands": self.bands,
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(
+            d.get("name", "revision"), d["start"], d["end"],
+            position_keys=(
+                None if d.get("position_keys") is None
+                else [(r[0], r[1:4]) for r in d["position_keys"]]
+            ),
+            heading_keys=(
+                None if d.get("heading_keys") is None
+                else [(r[0], r[1]) for r in d["heading_keys"]]
+            ),
+            bands=d.get("bands"),
+        )
+
+
+class Panel:
+    """Finite oriented band-transmission panel with editable placement.
+
+    width spans the horizontal in-panel axis and height spans z. heading
+    is the normal heading about z (0 points +x, pi/2 points +y). Position
+    and heading keyframes are smoothstep interpolated, so the panel can
+    slide or rotate during a take. bands gives one gain per RoomScene
+    frequency band; each is constant or DoorMotion keyframed. Revisions
+    override placement and/or gains only on their own intervals.
+    """
+
+    def __init__(self, name, width, height,
+                 position_keys=((0.0, (0.0, 0.0, 0.0)),),
+                 heading_keys=((0.0, 0.0),), bands=None, revisions=()):
+        self.name = str(name)
+        self.width = float(width)
+        self.height = float(height)
+        if self.width <= 0.0 or self.height <= 0.0:
+            raise ValueError("panel width and height must be positive")
+        rows = sorted((float(t), np.asarray(p, dtype=np.float64))
+                      for t, p in position_keys)
+        self._pos_times = np.array([t for t, _ in rows])
+        self._pos_values = np.stack([p for _, p in rows])
+        hrows = sorted((float(t), float(h)) for t, h in heading_keys)
+        self._head_times = np.array([t for t, _ in hrows])
+        self._head_values = np.unwrap(np.array([h for _, h in hrows]))
+        self.bands = None if bands is None else [
+            DoorMotion([(0.0, float(entry))]) if np.isscalar(entry)
+            else DoorMotion(entry)
+            for entry in bands
+        ]
+        self.revisions = list(revisions)
+
+    def base_pose_at(self, times):
+        """Base (position (n,3), heading (n,)), ignoring interval edits."""
+        tv = np.atleast_1d(np.asarray(times, dtype=np.float64))
+        pos = _smooth_curve(self._pos_times, self._pos_values, tv)
+        head = _smooth_curve(self._head_times, self._head_values[:, None], tv)[:, 0]
+        return pos, head
+
+    def base_band_gains_at(self, times):
+        if self.bands is None:
+            return None
+        tv = np.atleast_1d(np.asarray(times, dtype=np.float64))
+        return np.stack([m.open_fraction(tv) for m in self.bands], axis=1)
+
+    def version_at(self, times):
+        """Active revision name per sample ('base' outside every edit)."""
+        tv = np.atleast_1d(np.asarray(times, dtype=np.float64))
+        names = np.full(len(tv), "base", dtype=object)
+        for revision in self.revisions:
+            names[(tv >= revision.start) & (tv < revision.end)] = revision.name
+        return names
+
+    def pose_at(self, times):
+        """Effective (positions, headings) after interval revisions."""
+        tv = np.atleast_1d(np.asarray(times, dtype=np.float64))
+        pos, head = self.base_pose_at(tv)
+        for revision in self.revisions:
+            mask = (tv >= revision.start) & (tv < revision.end)
+            if not mask.any():
+                continue
+            rp = revision.sample_positions(tv[mask])
+            if rp is not None:
+                pos[mask] = rp
+            rh = revision.sample_headings(tv[mask])
+            if rh is not None:
+                head[mask] = rh
+        return pos, head
+
+    def band_gains_at(self, times):
+        """Effective per-band transmission as an (n, n_bands) array."""
+        tv = np.atleast_1d(np.asarray(times, dtype=np.float64))
+        gains = self.base_band_gains_at(tv)
+        for revision in self.revisions:
+            mask = (tv >= revision.start) & (tv < revision.end)
+            if not mask.any() or gains is None:
+                continue
+            rg = revision.sample_bands(len(self.bands), tv[mask])
+            if rg is None:
+                continue
+            gains[mask] = np.where(np.isnan(rg), gains[mask], rg)
+        return gains
+
+    def frames_at(self, times):
+        """Per-sample (center, normal, width-axis) geometry frames."""
+        centers, headings = self.pose_at(times)
+        normals = np.stack(
+            [np.cos(headings), np.sin(headings), np.zeros_like(headings)], axis=1
+        )
+        width_axes = np.stack(
+            [-np.sin(headings), np.cos(headings), np.zeros_like(headings)], axis=1
+        )
+        return centers, normals, width_axes
+
+    def segments_cross(self, a, b, times):
+        """Does segment a[i] -> b[i] cross the finite panel at time t[i]?"""
+        a = np.atleast_2d(np.asarray(a, dtype=np.float64))
+        b = np.atleast_2d(np.asarray(b, dtype=np.float64))
+        centers, normals, width_axes = self.frames_at(times)
+        delta = b - a
+        den = np.sum(delta * normals, axis=1)
+        side = np.sum((a - centers) * normals, axis=1)
+        hit = np.abs(den) > 1e-12
+        alpha = np.zeros_like(den)
+        alpha[hit] = -side[hit] / den[hit]
+        hit &= (alpha >= 0.0) & (alpha <= 1.0)
+        q = a + alpha[:, None] * delta
+        rel = q - centers
+        hit &= np.abs(np.sum(rel * width_axes, axis=1)) <= 0.5 * self.width
+        hit &= np.abs(rel[:, 2]) <= 0.5 * self.height
+        return hit
+
+    def to_dict(self):
+        return {
+            "name": self.name,
+            "width": self.width,
+            "height": self.height,
+            "position_keys": [
+                [float(t), *self._pos_values[i].tolist()]
+                for i, t in enumerate(self._pos_times)
+            ],
+            "heading_keys": [
+                [float(t), float(h)]
+                for t, h in zip(self._head_times, self._head_values)
+            ],
+            "bands": None if self.bands is None
+                    else [m.to_list() for m in self.bands],
+            "revisions": [r.to_dict() for r in self.revisions],
+        }
+
+    @classmethod
+    def from_dict(cls, d):
+        return cls(
+            d["name"], d["width"], d["height"],
+            position_keys=[
+                (r[0], r[1:4])
+                for r in d.get("position_keys", [[0.0, [0.0, 0.0, 0.0]]])
+            ],
+            heading_keys=[
+                (r[0], r[1]) for r in d.get("heading_keys", [[0.0, 0.0]])
+            ],
+            bands=d.get("bands"),
+            revisions=[PanelRevision.from_dict(r)
+                        for r in d.get("revisions", [])],
+        )
+
+
 class RoomScene:
     """Rooms + portals; answers direct/reverb transmission queries."""
 
@@ -233,10 +491,12 @@ class RoomScene:
     REVERB_CLOSED_GAIN = 0.3
     REVERB_NO_PATH_GAIN = 0.05
 
-    def __init__(self, rooms, portals=(), zones=(), band_edges=(1000.0,)):
+    def __init__(self, rooms, portals=(), zones=(), band_edges=(1000.0,),
+                 panels=()):
         self.rooms = list(rooms)
         self.portals = list(portals)
         self.zones = list(zones)
+        self.panels = list(panels)
         self._index = {r.name: i for i, r in enumerate(self.rooms)}
         edges = tuple(float(e) for e in band_edges)
         if any(e <= 0.0 for e in edges) or tuple(sorted(edges)) != edges:
@@ -246,6 +506,12 @@ class RoomScene:
             if zone.bands is not None and len(zone.bands) != self.n_bands:
                 raise ValueError(
                     f"zone {zone.name!r} has {len(zone.bands)} band gains but "
+                    f"the scene defines {self.n_bands} bands"
+                )
+        for panel in self.panels:
+            if panel.bands is not None and len(panel.bands) != self.n_bands:
+                raise ValueError(
+                    f"panel {panel.name!r} has {len(panel.bands)} band gains but "
                     f"the scene defines {self.n_bands} bands"
                 )
 
@@ -258,6 +524,11 @@ class RoomScene:
     def has_band_zones(self):
         """True when any zone carries per-band (frequency-dependent) gains."""
         return any(z.bands is not None for z in self.zones)
+
+    @property
+    def has_band_processing(self):
+        """True when zones or oriented panels define per-band gains."""
+        return self.has_band_zones or any(p.bands is not None for p in self.panels)
 
     def _portal_position(self, portal):
         """Door position: explicit, else midpoint of the two room centers."""
@@ -350,6 +621,42 @@ class RoomScene:
             factors = np.where(hit[:, None], factors * gains, factors)
         return factors
 
+    def panel_band_factors(self, waypoints, times):
+        """Per-sample, per-band gain from oriented panels on a polyline.
+
+        Every panel the listener-to-source polyline crosses at that same
+        listen time multiplies its band transmission. Geometry and gains
+        are both evaluated per sample, so moving/rotating a panel changes
+        only newly rendered sound; reverb bus state is never rewritten.
+        Returns (n, n_bands) or None.
+        """
+        if not self.panels or not any(p.bands is not None for p in self.panels):
+            return None
+        pts = [np.atleast_2d(np.asarray(w, dtype=np.float64)) for w in waypoints]
+        n = max(len(p) for p in pts)
+        tv = np.broadcast_to(np.asarray(times, dtype=np.float64), (n,))
+        factors = np.ones((n, self.n_bands))
+        for panel in self.panels:
+            if panel.bands is None:
+                continue
+            hit = np.zeros(n, dtype=bool)
+            for a, b in zip(pts[:-1], pts[1:]):
+                hit |= panel.segments_cross(a, b, tv)
+            gains = panel.band_gains_at(tv)
+            factors = np.where(hit[:, None], factors * gains, factors)
+        return factors
+
+    def combined_band_factors(self, waypoints, times):
+        """Per-band factors of both axis-aligned zones and panels."""
+        factors = np.ones((len(np.atleast_1d(times)), self.n_bands))
+        zone_factors = self.zone_band_factors(waypoints, times)
+        if zone_factors is not None:
+            factors *= zone_factors
+        panel_factors = self.panel_band_factors(waypoints, times)
+        if panel_factors is not None:
+            factors *= panel_factors
+        return factors if self.has_band_processing else None
+
     def room_index_at(self, positions):
         """Room index per point (n, 3); -1 when outside every room."""
         p = np.asarray(positions, dtype=np.float64)
@@ -373,7 +680,7 @@ class RoomScene:
 
         muffle_mix in [0, 1] crossfades to a fixed lowpassed copy of the
         signal, so the spectrum changes continuously with door motion.
-        Absorption zones only damp paths whose geometry crosses them.
+        Zones/panels only damp paths whose geometry crosses them.
         """
         n = len(times)
         gain = np.ones(n)
@@ -427,18 +734,18 @@ class RoomScene:
         """Per-sample, per-band extra gain from band zones on direct paths.
 
         Mirrors direct_transmission: every portal-graph path contributes
-        its own band factor (product of the per-band gains of the zones it
-        crosses), weighted by that path's scalar door gain. Returns an
-        (n, n_bands) array, or None when no zone has per-band gains.
+        its own band factor (product of the per-band gains of the zones and
+        panels it crosses), weighted by that path's scalar door gain.
+        Returns an (n, n_bands) array, or None without band materials.
         """
-        if not self.has_band_zones:
+        if not self.has_band_processing:
             return None
         n = len(times)
         out = np.ones((n, self.n_bands))
         diff = listener_idx != source_idx
         same = ~diff
         if same.any():
-            bf = self.zone_band_factors(
+            bf = self.combined_band_factors(
                 [source_pos[same], listener_pos[same]], times[same]
             )
             out[same] = bf
@@ -464,7 +771,7 @@ class RoomScene:
                 waypoints = [listener_pos[m]] + [
                     self._portal_position(portal) for portal in path
                 ] + [source_pos[m]]
-                bf = self.zone_band_factors(waypoints, times[m])
+                bf = self.combined_band_factors(waypoints, times[m])
                 g_sum += g_path
                 b_sum += g_path[:, None] * bf
             out[m] = np.where(
@@ -482,7 +789,7 @@ class RoomScene:
         place when it was produced; swapping a material later only colors
         newly generated sound. Returns (n, n_bands) or None.
         """
-        if not self.has_band_zones:
+        if not self.has_band_processing:
             return None
         n = len(times)
         out = np.ones((n, self.n_bands))
@@ -494,7 +801,7 @@ class RoomScene:
                 centers[m] = room.center
                 valid[m] = True
         if valid.any():
-            bf = self.zone_band_factors(
+            bf = self.combined_band_factors(
                 [source_pos[valid], centers[valid]], times[valid]
             )
             out[valid] = bf
@@ -548,6 +855,28 @@ class RoomScene:
                 band_gains *= np.asarray(bg, dtype=np.float64)
                 any_band = True
             zones_hit.append(entry)
+        panels_hit = []
+        for panel in self.panels:
+            if panel.bands is None:
+                continue
+            crossed = False
+            for a, b in zip(waypoints[:-1], waypoints[1:]):
+                if bool(panel.segments_cross(a, b, [t])[0]):
+                    crossed = True
+                    break
+            if not crossed:
+                continue
+            bg = panel.band_gains_at([t])[0]
+            center, heading = panel.pose_at([t])
+            panels_hit.append({
+                "name": panel.name,
+                "version": str(panel.version_at([t])[0]),
+                "position": [float(v) for v in center[0]],
+                "heading": float(heading[0]),
+                "bands": [float(v) for v in bg],
+            })
+            band_gains *= bg
+            any_band = True
         return {
             "time": t,
             "listener_room": room_name(li),
@@ -557,6 +886,7 @@ class RoomScene:
                 for p in best
             ],
             "zones": zones_hit,
+            "panels": panels_hit,
             "path_gain": float(score),
             "band_gains": [float(v) for v in band_gains] if any_band else None,
         }
@@ -606,6 +936,7 @@ class RoomScene:
             "rooms": [r.to_dict() for r in self.rooms],
             "portals": [p.to_dict() for p in self.portals],
             "zones": [z.to_dict() for z in self.zones],
+            "panels": [p.to_dict() for p in self.panels],
             "band_edges": list(self.band_edges),
         }
 
@@ -616,6 +947,7 @@ class RoomScene:
             [Portal.from_dict(p) for p in d.get("portals", [])],
             [AbsorptionZone.from_dict(z) for z in d.get("zones", [])],
             band_edges=d.get("band_edges", (1000.0,)),
+            panels=[Panel.from_dict(p) for p in d.get("panels", [])],
         )
 
 
@@ -690,3 +1022,11 @@ class RoomReverb:
             for i, zi in enumerate(ch_state["allpasses"]):
                 b, a, _ = allpasses[i]
                 allpasses[i] = (b, a, np.asarray(zi, dtype=np.float64))
+
+    def reset_state(self):
+        """Replace every carried delay line with silence."""
+        for ci, (combs, allpasses) in enumerate(self._channels):
+            self._channels[ci] = (
+                [(b, a, np.zeros_like(zi)) for b, a, zi in combs],
+                [(b, a, np.zeros_like(zi)) for b, a, zi in allpasses],
+            )

@@ -2,7 +2,8 @@
 
 纯 Python + NumPy/SciPy 实现的连续时间双声道空间声引擎。支持直达声
 （方位声像、距离衰减、运动多普勒、平滑开关、多声源混合）以及房间/门洞
-参与的传播：遮挡衰减与低通、按门开度连续变化的音量与频谱、每房间混响尾音。
+参与的传播：遮挡衰减与低通、按门开度连续变化的音量与频谱、每房间混响尾音；
+Panel 提供有限大小、有朝向、可移动旋转、可按区间修订的频带透过面板。
 
 ## 模块
 
@@ -14,7 +15,8 @@
   Emitter（声音资源 + 轨迹 + 音量/开关），三者状态互不耦合。
 - spatial_audio/engine.py — SpatialEngine：核心渲染。
 - spatial_audio/recording.py — MotionRecording：把运动轨迹、音调参数、开关事件
-  存为 JSON，可重建场景并重放，导出结果可复现。
+  存为 JSON，可重建场景并重放，导出结果可复现；kind="mix_tones" 可在同一
+  声源中放低/中/高多个正弦成分，用于逐频带核对。
 - spatial_audio/rooms.py — Room（轴对齐房间盒 + 混响参数）、Portal（连接两个
   房间的门，DoorMotion 关键帧描述开度随时间变化，smoothstep 插值保证连续）、
   RoomScene（回答直达/混响透射查询）、RoomReverb（反馈梳状 + 全通滤波器组，
@@ -57,6 +59,16 @@
   使用新材料。RoomScene.explain_path(listener, source, t) 返回某收听
   时刻的最强传播路径：经过的门及开度、穿过的吸声区域及其当时的
   逐频带增益。未指定 bands 的区域仍按原宽频 gain/muffle 工作。
+- 可移动可修订面板：Panel 是有限矩形频带面板，位置与法向朝向按时间
+  smoothstep 插值；RoomScene(band_edges=(500, 2000)) 时可直接给低/中/高
+  三频透过量。面板移动到一条路径外时，只是不再给新声音加滤波，进入
+  混响总线的旧尾音继续按其产生时的面板版本衰减；另一条从不相交的路径
+  逐采样不变。PanelRevision(start, end, ..., bands=[...]) 仅在指定区间
+  替换位置/朝向/频带透过量，频带填 None 表示沿用基础版本。
+  SpatialEngine.render_recomputed_from(boundary, duration) 先快进到边界、
+  再清空混响尾音总线，供比较“保留历史”与“从边界重算”的听感差别。
+  panel_version_manifest(recording) 导出每段实际使用的面板版本、位置、
+  朝向和逐频带增益；explain_path 也会列出当时穿过的面板。
 - 一次记录、多种重放：MotionRecording 保存轨迹/音调/开关事件与房间方案；
   render_recording(..., scene=...) 或 recording.with_scene(scene) 可用
   同一行走记录重放不同的门安排或加吸声区域的方案。
@@ -99,6 +111,14 @@
   band_room2_swap.wav / band_check.png — 频带化吸声对比：同一行走记录，
   原墙面、低通透/高频吸收面板、以及 t=5 s 中途更换材料三种方案，
   图中按 1 kHz 分频分别对比低/高频带能量。
+- outputs/panel_history.wav / panel_recomputed_boundary.wav /
+  panel_route_crossing.wav / panel_route_other.wav / panel_check.png —
+  低/中/高三频声音与两条路径上的移动可修订面板：面板滑离相交路径后旧
+  尾音保留，另一条路径全程不受影响；history 与 boundary recompute 两个
+  WAV 可直接 A/B 试听。
+- outputs/panel_versions.json / panel_recording.json /
+  panel_checkpoint.json — 每段实际使用的面板版本（位置、朝向、三频透过量）、
+  可复放记录和边界暂停检查点。
 
 测试：
 

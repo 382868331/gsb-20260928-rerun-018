@@ -292,7 +292,7 @@ class SpatialEngine:
                 src = src * (1.0 - mix_s) + muffled * mix_s
 
             direct_src = src
-            if scene is not None and scene.has_band_zones:
+            if scene is not None and scene.has_band_processing:
                 # Frequency-dependent absorption: split into bands and
                 # weigh each by the zones the direct paths cross. Sound
                 # produced now uses the materials in place now; tails
@@ -316,7 +316,7 @@ class SpatialEngine:
 
             if scene is not None:
                 send_base = src * gate * dist_gain * emitter.volume
-                if scene.has_band_zones:
+                if scene.has_band_processing:
                     # Band-filter the send where it enters the room bus,
                     # so a decaying tail keeps the spectrum of the
                     # materials present when it was produced.
@@ -435,6 +435,40 @@ class SpatialEngine:
         if start > 0.0:
             self._render_span(0.0, start, block_size)
         return self._render_span(start, end - start, block_size)
+
+    def reset_reverb_buses(self):
+        """Discard reverb tail state, keeping direct-path carry state.
+
+        This is the boundary-recompute choice: after fast-forwarding to a
+        revision boundary, the direct sound and its envelopes continue
+        from the actual history, but no pre-boundary reverb tail is kept.
+        The default render instead keeps every tail already produced.
+        """
+        for reverb in self._reverbs:
+            reverb.reset_state()
+        self._reverb_gain_states = [0.0] * len(self._reverb_gain_states)
+
+    def render_recomputed_from(self, boundary, duration,
+                               block_size=1024, reset_reverbs=True):
+        """Recompute the tail of a take starting at a revision boundary.
+
+        Fast-forward [0, boundary) so direct-path envelopes and per-source
+        filters remain physically continuous, optionally discard the reverb
+        buses at the boundary, then render [boundary, boundary+duration).
+        With reset_reverbs=False this is the ordinary history-preserving
+        render; with True it is the explicit "recompute from boundary"
+        comparison in which old tails are not carried forward.
+        """
+        boundary = float(boundary)
+        if boundary < 0.0:
+            raise ValueError("boundary must be non-negative")
+        if boundary > 0.0:
+            self._render_span(0.0, boundary, block_size)
+        if reset_reverbs:
+            self.reset_reverb_buses()
+        result = self._render_span(boundary, float(duration), block_size)
+        self._clock = boundary + float(duration)
+        return result
 
     def get_state(self):
         """JSON-friendly snapshot of all carried state (for checkpoints)."""

@@ -1,0 +1,70 @@
+{
+  "sample_rate": 48000,
+  "start": 0.0,
+  "end": 4.0,
+  "band_edges": [
+    500.0,
+    2000.0
+  ],
+  "panels": [
+    {
+      "name": "moving_band_panel",
+      "segments": [
+        {
+          "version": "base",
+          "sample_start": 0,
+          "sample_end": 67200,
+          "time_start": 1.0416666666666666e-05,
+          "time_end": 1.4000104166666667,
+          "position": [
+            -1.0,
+            0.0,
+            0.0
+          ],
+          "heading": 0.0,
+          "band_gains": [
+            0.9,
+            0.25,
+            0.05
+          ]
+        },
+        {
+          "version": "high_band_reopened",
+          "sample_start": 67200,
+          "sample_end": 115200,
+          "time_start": 1.4000104166666667,
+          "time_end": 2.4000104166666665,
+          "position": [
+            -1.0,
+            -1.3020742911189009e-09,
+            0.0
+          ],
+          "heading": 3.5807043005769775e-10,
+          "band_gains": [
+            0.9,
+            0.25,
+            0.05000000172929941
+          ]
+        },
+        {
+          "version": "base",
+          "sample_start": 115200,
+          "sample_end": 192000,
+          "time_start": 2.4000104166666665,
+          "time_end": 4.000010416666667,
+          "position": [
+            -1.0,
+            -4.0,
+            0.0
+          ],
+          "heading": 1.1,
+          "band_gains": [
+            0.9,
+            0.25,
+            0.05
+          ]
+        }
+      ]
+    }
+  ]
+}

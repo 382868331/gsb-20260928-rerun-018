@@ -12,6 +12,7 @@ Outputs (in outputs/):
 
 from pathlib import Path
 
+import json
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -22,11 +23,14 @@ from spatial_audio import (
     AbsorptionZone,
     DoorMotion,
     MotionRecording,
+    Panel,
+    PanelRevision,
     Portal,
     Room,
     RoomScene,
     Trajectory,
     load_checkpoint,
+    panel_version_manifest,
     render_recording,
     save_checkpoint,
 )
@@ -506,7 +510,168 @@ def demo_bands():
     print("band absorption checks passed.")
 
 
+PANEL_DURATION = 4.0
+
+
+def _panel_scene():
+    room = Room("hall", (-8.0, -4.0, -2.0), (4.0, 4.0, 2.0),
+                reverb_time=1.2, reverb_send=0.6)
+    panel = Panel(
+        "moving_band_panel",
+        width=1.4,
+        height=3.0,
+        position_keys=[
+            (0.0, (-1.0, 0.0, 0.0)),
+            (1.4, (-1.0, 0.0, 0.0)),
+            (2.4, (-1.0, -4.0, 0.0)),
+        ],
+        heading_keys=[
+            (0.0, 0.0),
+            (1.4, 0.0),
+            (2.4, 1.1),
+        ],
+        bands=[0.9, 0.25, 0.05],
+        revisions=[PanelRevision(
+            "high_band_reopened",
+            start=1.4,
+            end=2.4,
+            bands=[None, None, [(1.4, 0.05), (1.8, 0.9)]],
+        )],
+    )
+    return RoomScene([room], band_edges=(500.0, 2000.0), panels=[panel]), panel
+
+
+def _panel_recording(scene):
+    rec = MotionRecording(
+        duration=PANEL_DURATION,
+        sample_rate=SR,
+        listener_trajectory=Trajectory.linear([(0.0, (-6.0, 0.0, 0.0))]),
+        listener_forward=(1.0, 0.0, 0.0),
+        scene=scene,
+        emitters=[
+            EmitterSpec(
+                name="crossing_route",
+                kind="mix_tones",
+                params={"duration": PANEL_DURATION, "fade": 0.005,
+                         "tones": [(200.0, 0.28), (1000.0, 0.28),
+                                   (5000.0, 0.28)]},
+                trajectory=Trajectory.linear([(0.0, (0.0, 0.0, 0.0))]),
+                events=[(1.0, False)],
+            ),
+            EmitterSpec(
+                name="other_route",
+                kind="mix_tones",
+                params={"duration": PANEL_DURATION, "fade": 0.005,
+                         "tones": [(200.0, 0.28), (1000.0, 0.28),
+                                   (5000.0, 0.28)]},
+                trajectory=Trajectory.linear([(0.0, (0.0, 3.0, 0.0))]),
+                events=[(3.0, False)],
+            ),
+        ],
+    )
+    return rec
+
+
+def demo_moving_panel():
+    """Moving/oriented 3-band panel, interval revision, two comparison takes."""
+    scene, panel = _panel_scene()
+    recording = _panel_recording(scene)
+    recording.save(OUT / "panel_recording.json")
+
+    # History-preserving render: the source on the crossing route stops at
+    # 1 s; its tail keeps the old panel basis after the panel slides away.
+    history = render_recording(recording, block_size=1024)
+    sf.write(OUT / "panel_history.wav", history.samples, SR, subtype="PCM_16")
+
+    # Boundary-recompute comparison: fast-forward to the revision boundary,
+    # clear only reverb buses, then continue. Old tails are intentionally
+    # absent, making the listening difference directly audible.
+    engine = build_engine(recording)
+    recomputed_tail = engine.render_recomputed_from(
+        1.4, PANEL_DURATION - 1.4, block_size=1024, reset_reverbs=True
+    ).samples
+    recomputed = np.zeros_like(history.samples)
+    recomputed[:int(1.4 * SR)] = history.samples[:int(1.4 * SR)]
+    recomputed[int(1.4 * SR):] = recomputed_tail
+    sf.write(OUT / "panel_recomputed_boundary.wav", recomputed, SR,
+             subtype="PCM_16")
+
+    # Isolate the two geometric routes for A/B listening.
+    crossing_rec = MotionRecording(
+        PANEL_DURATION, SR, recording.listener_trajectory,
+        recording.listener_forward, [recording.emitters[0]], scene=scene,
+    )
+    other_rec = MotionRecording(
+        PANEL_DURATION, SR, recording.listener_trajectory,
+        recording.listener_forward, [recording.emitters[1]], scene=scene,
+    )
+    crossing = render_recording(crossing_rec, block_size=1024)
+    other = render_recording(other_rec, block_size=1024)
+    sf.write(OUT / "panel_route_crossing.wav", crossing.samples, SR,
+             subtype="PCM_16")
+    sf.write(OUT / "panel_route_other.wav", other.samples, SR,
+             subtype="PCM_16")
+
+    # Block-size invariance of the complete moving/revised scenario.
+    reference = history.samples
+    block_diffs = {}
+    for block_size in (37, 256, 4099):
+        out = render_recording(recording, block_size=block_size).samples
+        block_diffs[block_size] = float(np.max(np.abs(out - reference)))
+
+    # Pause/resume at the revision boundary and an interval render both
+    # match the same samples of the uninterrupted history render.
+    chunk_engine = build_engine(recording)
+    before_pause = chunk_engine.render_chunk(1.4).samples
+    save_checkpoint(recording, chunk_engine, OUT / "panel_checkpoint.json")
+    after_pause = chunk_engine.render_chunk(PANEL_DURATION - 1.4).samples
+    _, resumed_engine = load_checkpoint(OUT / "panel_checkpoint.json")
+    resumed = resumed_engine.render_chunk(PANEL_DURATION - 1.4).samples
+    pause_diff = float(np.max(np.abs(resumed - after_pause)))
+    interval = build_engine(recording).render_interval(
+        0.7, 2.6, block_size=512
+    ).samples
+    interval_diff = float(np.max(np.abs(
+        interval - reference[int(0.7 * SR):int(2.6 * SR)]
+    )))
+
+    manifest = panel_version_manifest(recording)
+    with open(OUT / "panel_versions.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+    t, rms = channel_rms(history.samples)
+    _, rms_cross = channel_rms(crossing.samples)
+    _, rms_other = channel_rms(other.samples)
+    _, rms_recompute = channel_rms(recomputed)
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(t, rms[:, 0], label="history (old tail retained)", lw=1.5)
+    ax.plot(t, rms_recompute[:, 0], "--",
+            label="recomputed from boundary (old tail cleared)")
+    ax.plot(t, rms_cross[:, 0], ":", label="crossing route only")
+    ax.plot(t, rms_other[:, 0], ":", label="other route only")
+    for x, label in [(1.0, "crossing source off"), (1.4, "revision starts"),
+                     (2.4, "panel leaves / revision ends"), (3.0, "other off")]:
+        ax.axvline(x, color="gray", ls=":", lw=0.8)
+        ax.text(x, ax.get_ylim()[1] * 0.92, label, rotation=90, va="top",
+                fontsize=8)
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("RMS level")
+    ax.set_title("Moving oriented 3-band panel: history vs boundary recompute")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(OUT / "panel_check.png", dpi=130)
+
+    assert max(block_diffs.values()) < 1e-10
+    assert pause_diff < 1e-10 and interval_diff < 1e-10
+    print(f"wrote panel_history.wav / panel_recomputed_boundary.wav and route A/B WAVs")
+    print(f"panel version manifest: {OUT / 'panel_versions.json'}")
+    print(f"block-size max differences: {block_diffs}")
+    print(f"pause/resume diff: {pause_diff:.3e}, interval diff: {interval_diff:.3e}")
+
+
 if __name__ == "__main__":
     main()
     demo_corridor()
     demo_bands()
+    demo_moving_panel()

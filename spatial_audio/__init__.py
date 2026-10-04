@@ -18,10 +18,19 @@ from .engine import SpatialEngine, RenderResult
 from .recording import (
     MotionRecording,
     load_checkpoint,
+    panel_version_manifest,
     render_recording,
     save_checkpoint,
 )
-from .rooms import AbsorptionZone, DoorMotion, Portal, Room, RoomScene
+from .rooms import (
+    AbsorptionZone,
+    DoorMotion,
+    Panel,
+    PanelRevision,
+    Portal,
+    Room,
+    RoomScene,
+)
 
 __all__ = [
     "SoundResource",
@@ -33,6 +42,7 @@ __all__ = [
     "RenderResult",
     "MotionRecording",
     "render_recording",
+    "panel_version_manifest",
     "save_checkpoint",
     "load_checkpoint",
     "DoorMotion",
@@ -40,4 +50,6 @@ __all__ = [
     "Room",
     "RoomScene",
     "AbsorptionZone",
+    "Panel",
+    "PanelRevision",
 ]
