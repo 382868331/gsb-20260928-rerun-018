@@ -8,6 +8,7 @@ a route it never crosses remains bit-identical.
 import numpy as np
 
 from spatial_audio import (
+    adopt_panel_revision,
     Emitter,
     Listener,
     MotionRecording,
@@ -20,8 +21,11 @@ from spatial_audio import (
     Trajectory,
     load_checkpoint,
     panel_version_manifest,
+    remaining_panel_conflicts,
+    render_panel_candidate,
     render_recording,
     save_checkpoint,
+    withdraw_panel_revision,
 )
 from spatial_audio.recording import EmitterSpec, build_engine
 
@@ -219,3 +223,124 @@ def test_block_size_pause_resume_interval_and_recording_agree(tmp_path):
     assert stored.name == "mover"
     assert stored.revisions[0].name == "open_high"
     assert len(stored._pos_times) == 3
+
+
+def _conflict_recording(duration=2.2):
+    panel = Panel(
+        "conflict",
+        width=1.2,
+        height=3.0,
+        position_keys=[(0.0, PANEL_POS)],
+        heading_keys=[(0.0, 0.0)],
+        bands=[0.9, 0.2, 0.05],
+        revisions=[
+            PanelRevision("first", 1.0, 2.0, bands=[0.2, 0.2, 0.2]),
+            PanelRevision("second", 1.0, 2.0, bands=[0.95, 0.95, 0.95]),
+        ],
+    )
+    return MotionRecording(
+        duration=duration,
+        sample_rate=SR,
+        listener_trajectory=Trajectory.linear([(0.0, LISTEN_A)]),
+        listener_forward=(1.0, 0.0, 0.0),
+        scene=_scene(panel),
+        emitters=[EmitterSpec(
+            "src", "tone",
+            {"frequency": HIGH, "duration": duration, "fade": 0.003},
+            Trajectory.linear([(0.0, SOURCE_A)]),
+        )],
+    ), panel
+
+
+def test_overlapping_panel_candidates_need_explicit_partial_choice():
+    rec, panel = _conflict_recording()
+    initial = render_recording(rec, block_size=512).samples
+    first_only, _ = _conflict_recording()
+    first_only.scene.panels[0].revisions.pop(1)
+    expected_first = render_recording(first_only, block_size=513).samples
+    np.testing.assert_allclose(initial, expected_first, atol=1e-12)
+
+    conflicts = remaining_panel_conflicts(rec)
+    assert conflicts == [{
+        "panel": "conflict",
+        "conflicts": [{"start": 1.0, "end": 2.0,
+                       "candidates": ["first", "second"]}],
+    }]
+
+    adopt_panel_revision(rec, "conflict", "second", 1.3, 1.7)
+    chosen = render_recording(rec, block_size=777).samples
+    assert _rms(chosen, 1.1, 1.25) < _rms(chosen, 1.45, 1.55) / 3.0
+    assert _rms(chosen, 1.8, 1.95) < _rms(chosen, 1.45, 1.55) / 3.0
+    assert remaining_panel_conflicts(rec)[0]["conflicts"] == [
+        {"start": 1.0, "end": 1.3, "candidates": ["first", "second"]},
+        {"start": 1.7, "end": 2.0, "candidates": ["first", "second"]},
+    ]
+
+    manifest = panel_version_manifest(rec, start=0.9, end=2.1)
+    segments = manifest["panels"][0]["segments"]
+    assert [(s["version"], s["decision"], s["unresolved_conflict"]) for s in segments] == [
+        ("base", None, False),
+        ("first", None, True),
+        ("second", "second", False),
+        ("first", None, True),
+        ("base", None, False),
+    ]
+
+    withdraw_panel_revision(rec, "conflict", "second", 1.3, 1.7)
+    reopened = render_recording(rec, block_size=1024).samples
+    np.testing.assert_allclose(reopened, initial, atol=1e-12)
+
+
+def test_panel_candidate_preview_marks_history_and_recomputed_outputs():
+    audible, _ = _conflict_recording(duration=2.2)
+    audible.emitters[0].events = [(1.5, False)]
+    tailed, _ = _conflict_recording(duration=2.2)
+    tailed.emitters[0].events = [(0.9, False)]
+
+    first = render_panel_candidate(
+        audible, "conflict", "first", 1.0, 2.0,
+        boundary=1.0, mode="history", block_size=257,
+    )
+    second = render_panel_candidate(
+        audible, "conflict", "second", 1.0, 2.0,
+        boundary=1.0, mode="history", block_size=811,
+    )
+    recomputed = render_panel_candidate(
+        tailed, "conflict", "first", 1.0, 2.0,
+        boundary=1.0, mode="recomputed", block_size=4099,
+    )
+    historical = render_panel_candidate(
+        tailed, "conflict", "first", 1.0, 2.0,
+        boundary=1.0, mode="history", block_size=4099,
+    )
+
+    assert first.output_mode == "history"
+    assert first.tail_source == "preserved"
+    assert recomputed.output_mode == "recomputed"
+    assert recomputed.tail_source == "discarded"
+    assert _rms(second.samples, 0.1, 0.2) > 3.0 * _rms(first.samples, 0.1, 0.2)
+    assert _rms(historical.samples, 0.5, 0.8) > 100.0 * _rms(
+        recomputed.samples, 0.5, 0.8
+    )
+
+
+def test_pending_panel_decisions_survive_save_and_block_render(tmp_path):
+    rec, panel = _conflict_recording()
+    adopt_panel_revision(rec, "conflict", "second", 1.25, 1.75)
+    full = render_recording(rec, block_size=1024).samples
+
+    path = tmp_path / "pending.json"
+    rec.save(path)
+    loaded = MotionRecording.load(path)
+    stored = loaded.scene.panels[0]
+    assert len(stored.revisions) == 2
+    assert stored.decisions == [[1.25, 1.75, "second"]]
+    assert remaining_panel_conflicts(loaded)[0]["conflicts"] == [
+        {"start": 1.0, "end": 1.25, "candidates": ["first", "second"]},
+        {"start": 1.75, "end": 2.0, "candidates": ["first", "second"]},
+    ]
+    for block_size in (1, 37, 256, 10007):
+        np.testing.assert_allclose(
+            render_recording(loaded, block_size=block_size).samples,
+            full, atol=1e-11,
+        )

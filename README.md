@@ -69,6 +69,14 @@ Panel 提供有限大小、有朝向、可移动旋转、可按区间修订的�
   再清空混响尾音总线，供比较“保留历史”与“从边界重算”的听感差别。
   panel_version_manifest(recording) 导出每段实际使用的面板版本、位置、
   朝向和逐频带增益；explain_path 也会列出当时穿过的面板。
+  两位编辑者提交相互重叠的 PanelRevision 时，后提交不会覆盖先提交：
+  未显式决定的重叠区间同时保留候选并在 panel_version_manifest /
+  remaining_panel_conflicts 中导出。render_panel_candidate(...) 可分别
+  A/B 试听候选；adopt_panel_revision(...) 只采用用户明确选择的子区间，
+  withdraw_panel_revision(...) 撤回选择但保留候选。试听结果的
+  output_mode/tail_source 区分保留旧尾声（history）与边界重算
+  （recomputed）；未决候选与已做选择随记录保存，重开后任意分块渲染
+  仍与完整渲染一致。
 - 一次记录、多种重放：MotionRecording 保存轨迹/音调/开关事件与房间方案；
   render_recording(..., scene=...) 或 recording.with_scene(scene) 可用
   同一行走记录重放不同的门安排或加吸声区域的方案。

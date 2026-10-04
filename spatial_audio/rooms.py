@@ -344,7 +344,8 @@ class Panel:
 
     def __init__(self, name, width, height,
                  position_keys=((0.0, (0.0, 0.0, 0.0)),),
-                 heading_keys=((0.0, 0.0),), bands=None, revisions=()):
+                 heading_keys=((0.0, 0.0),), bands=None, revisions=(),
+                 decisions=()):
         self.name = str(name)
         self.width = float(width)
         self.height = float(height)
@@ -363,6 +364,65 @@ class Panel:
             for entry in bands
         ]
         self.revisions = list(revisions)
+        # Explicit user choices as [start, end, revision_name]. "base"
+        # explicitly chooses no interval revision. These choices never
+        # change because another candidate is submitted later.
+        self.decisions = [list(d) for d in decisions]
+
+    def add_revision(self, revision):
+        """Submit a candidate without replacing an overlapping edit."""
+        self.revisions.append(revision)
+        return revision
+
+    def _revision_index(self, name):
+        matches = [i for i, r in enumerate(self.revisions) if r.name == name]
+        if not matches:
+            raise KeyError(f"panel {self.name!r} has no revision {name!r}")
+        return matches[0]
+
+    def _revision_lookup(self):
+        return {r.name: i for i, r in enumerate(self.revisions)}
+
+    def candidates_at(self, times):
+        """Candidate revision names covering each scalar sample time."""
+        tv = np.atleast_1d(np.asarray(times, dtype=np.float64))
+        return [
+            [r.name for r in self.revisions if r.start <= float(t) < r.end]
+            for t in tv
+        ]
+
+    def decision_names_at(self, times):
+        """Explicitly selected revision name per sample, or None."""
+        tv = np.atleast_1d(np.asarray(times, dtype=np.float64))
+        names = np.full(len(tv), None, dtype=object)
+        for start, end, name in self.decisions:
+            names[(tv >= start) & (tv < end)] = name
+        return names
+
+    def active_indices(self, times):
+        """Selected revision index per sample; -1 means the base panel."""
+        tv = np.atleast_1d(np.asarray(times, dtype=np.float64))
+        n = len(tv)
+        active = np.full(n, -1, dtype=np.int64)
+        if self.revisions:
+            covers = np.zeros((n, len(self.revisions)), dtype=bool)
+            for i, revision in enumerate(self.revisions):
+                covers[:, i] = (tv >= revision.start) & (tv < revision.end)
+            any_cover = covers.any(axis=1)
+            active[any_cover] = np.argmax(covers[any_cover], axis=1)
+
+        lookup = self._revision_lookup()
+        decisions = self.decision_names_at(tv)
+        for i, name in enumerate(decisions):
+            if name is None:
+                continue
+            if name == "base":
+                active[i] = -1
+            elif name in lookup:
+                ri = lookup[name]
+                if self.revisions[ri].start <= tv[i] < self.revisions[ri].end:
+                    active[i] = ri
+        return active
 
     def base_pose_at(self, times):
         """Base (position (n,3), heading (n,)), ignoring interval edits."""
@@ -380,17 +440,19 @@ class Panel:
     def version_at(self, times):
         """Active revision name per sample ('base' outside every edit)."""
         tv = np.atleast_1d(np.asarray(times, dtype=np.float64))
-        names = np.full(len(tv), "base", dtype=object)
-        for revision in self.revisions:
-            names[(tv >= revision.start) & (tv < revision.end)] = revision.name
-        return names
+        idx = self.active_indices(tv)
+        return np.array(
+            ["base" if i < 0 else self.revisions[i].name for i in idx],
+            dtype=object,
+        )
 
     def pose_at(self, times):
         """Effective (positions, headings) after interval revisions."""
         tv = np.atleast_1d(np.asarray(times, dtype=np.float64))
         pos, head = self.base_pose_at(tv)
-        for revision in self.revisions:
-            mask = (tv >= revision.start) & (tv < revision.end)
+        active = self.active_indices(tv)
+        for i, revision in enumerate(self.revisions):
+            mask = active == i
             if not mask.any():
                 continue
             rp = revision.sample_positions(tv[mask])
@@ -405,8 +467,9 @@ class Panel:
         """Effective per-band transmission as an (n, n_bands) array."""
         tv = np.atleast_1d(np.asarray(times, dtype=np.float64))
         gains = self.base_band_gains_at(tv)
-        for revision in self.revisions:
-            mask = (tv >= revision.start) & (tv < revision.end)
+        active = self.active_indices(tv)
+        for i, revision in enumerate(self.revisions):
+            mask = active == i
             if not mask.any() or gains is None:
                 continue
             rg = revision.sample_bands(len(self.bands), tv[mask])
@@ -414,6 +477,107 @@ class Panel:
                 continue
             gains[mask] = np.where(np.isnan(rg), gains[mask], rg)
         return gains
+
+    def select_revision(self, name, start=None, end=None):
+        """Adopt one candidate on an explicit subinterval.
+
+        The choice is clipped to that candidate's interval. Passing
+        name="base" reverts the selected interval to the base panel.
+        Existing choices outside the interval are retained.
+        """
+        if name != "base":
+            revision = self.revisions[self._revision_index(name)]
+            lo, hi = revision.start, revision.end
+        else:
+            if start is None or end is None:
+                raise ValueError("selecting the base panel requires start and end")
+            lo, hi = -np.inf, np.inf
+        if start is None:
+            start = lo
+        if end is None:
+            end = hi
+        start, end = float(start), float(end)
+        if not start < end:
+            raise ValueError("selection needs start < end")
+        start = max(start, lo)
+        end = min(end, hi)
+        if not start < end:
+            raise ValueError("selection does not overlap the candidate")
+        self._set_decision(start, end, name)
+        return {"panel": self.name, "revision": name,
+                "start": start, "end": end}
+
+    def _set_decision(self, start, end, name):
+        pieces = []
+        for a, b, old_name in self.decisions:
+            if end <= a or b <= start:
+                pieces.append([a, b, old_name])
+                continue
+            if a < start:
+                pieces.append([a, start, old_name])
+            if end < b:
+                pieces.append([end, b, old_name])
+        pieces.append([start, end, name])
+        pieces.sort(key=lambda x: (x[0], x[1]))
+        merged = []
+        for piece in pieces:
+            if merged and piece[2] == merged[-1][2] and piece[0] <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], piece[1])
+            else:
+                merged.append(piece)
+        self.decisions = merged
+
+    def unselect_revision(self, name=None, start=None, end=None):
+        """Withdraw explicit choices and leave those spans unresolved."""
+        if start is None or end is None:
+            if name is None:
+                old = list(self.decisions)
+                self.decisions = []
+                return old
+            revision = self.revisions[self._revision_index(name)]
+            start = revision.start if start is None else start
+            end = revision.end if end is None else end
+        start, end = float(start), float(end)
+        kept = []
+        for a, b, old_name in self.decisions:
+            if name is not None and old_name != name:
+                kept.append([a, b, old_name])
+                continue
+            if end <= a or b <= start:
+                kept.append([a, b, old_name])
+            else:
+                if a < start:
+                    kept.append([a, start, old_name])
+                if end < b:
+                    kept.append([end, b, old_name])
+        self.decisions = sorted(kept, key=lambda x: (x[0], x[1]))
+
+    def remaining_conflicts(self, horizon=None):
+        """Maximal unresolved spans containing two or more candidates."""
+        if len(self.revisions) < 2:
+            return []
+        bounds = {0.0}
+        if horizon is not None:
+            bounds.add(float(horizon))
+        for revision in self.revisions:
+            bounds.add(revision.start)
+            bounds.add(revision.end)
+        for start, end, _ in self.decisions:
+            bounds.add(start)
+            bounds.add(end)
+        bounds = sorted(b for b in bounds if b >= 0.0 and (
+            horizon is None or b <= horizon))
+        conflicts = []
+        for a, b in zip(bounds[:-1], bounds[1:]):
+            if b <= a:
+                continue
+            t = 0.5 * (a + b)
+            candidates = [r.name for r in self.revisions if r.start <= t < r.end]
+            decided = self.decision_names_at([t])[0] is not None
+            if len(candidates) > 1 and not decided:
+                conflicts.append({"start": float(a), "end": float(b),
+                                  "candidates": candidates})
+        return conflicts
 
     def frames_at(self, times):
         """Per-sample (center, normal, width-axis) geometry frames."""
@@ -460,6 +624,7 @@ class Panel:
             "bands": None if self.bands is None
                     else [m.to_list() for m in self.bands],
             "revisions": [r.to_dict() for r in self.revisions],
+            "decisions": [list(d) for d in self.decisions],
         }
 
     @classmethod
@@ -476,6 +641,7 @@ class Panel:
             bands=d.get("bands"),
             revisions=[PanelRevision.from_dict(r)
                         for r in d.get("revisions", [])],
+            decisions=d.get("decisions", []),
         )
 
 

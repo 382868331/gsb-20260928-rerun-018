@@ -17,10 +17,14 @@ from .scene import Emitter, Listener
 from .engine import SpatialEngine, RenderResult
 from .recording import (
     MotionRecording,
+    adopt_panel_revision,
     load_checkpoint,
     panel_version_manifest,
+    remaining_panel_conflicts,
+    render_panel_candidate,
     render_recording,
     save_checkpoint,
+    withdraw_panel_revision,
 )
 from .rooms import (
     AbsorptionZone,
@@ -41,7 +45,11 @@ __all__ = [
     "SpatialEngine",
     "RenderResult",
     "MotionRecording",
+    "adopt_panel_revision",
     "render_recording",
+    "render_panel_candidate",
+    "withdraw_panel_revision",
+    "remaining_panel_conflicts",
     "panel_version_manifest",
     "save_checkpoint",
     "load_checkpoint",

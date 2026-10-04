@@ -15,7 +15,7 @@ from .resources import SoundResource
 from .trajectory import Trajectory
 from .scene import Emitter, Listener
 from .engine import SpatialEngine, RenderResult
-from .rooms import RoomScene
+from .rooms import Panel, RoomScene
 
 
 @dataclass
@@ -167,6 +167,91 @@ def render_recording(recording: MotionRecording, block_size: int = 1024,
     return engine.render(recording.duration, block_size=block_size)
 
 
+def _clone_scene(scene: RoomScene) -> RoomScene:
+    return RoomScene.from_dict(scene.to_dict())
+
+
+def _find_panel(scene: RoomScene, panel_name: str) -> Panel:
+    matches = [p for p in scene.panels if p.name == panel_name]
+    if not matches:
+        raise KeyError('scene has no panel ' + repr(panel_name))
+    return matches[0]
+
+
+def render_panel_candidate(recording: MotionRecording, panel_name: str,
+                           candidate: str, start=None, end=None,
+                           block_size: int = 1024, *,
+                           boundary=None, mode: str = "history",
+                           reset_reverbs=None):
+    """Render an A/B preview for one overlapping panel candidate."""
+    if recording.scene is None:
+        raise ValueError("recording has no room scene")
+    scene = _clone_scene(recording.scene)
+    panel = _find_panel(scene, panel_name)
+    revision = panel.revisions[panel._revision_index(candidate)]
+    start = revision.start if start is None else float(start)
+    end = revision.end if end is None else float(end)
+    start = max(start, revision.start)
+    end = min(end, revision.end)
+    if not start < end:
+        raise ValueError("preview interval does not overlap the candidate")
+    boundary = start if boundary is None else float(boundary)
+    if boundary < 0.0 or boundary > start:
+        raise ValueError("boundary must be in [0, candidate interval start]")
+    if mode not in {"history", "recomputed"}:
+        raise ValueError("mode must be history or recomputed")
+    panel._set_decision(start, end, candidate)
+    engine = build_engine(recording, scene=scene)
+    if reset_reverbs is None:
+        reset_reverbs = mode == "recomputed"
+    if boundary > 0.0:
+        engine._render_span(0.0, boundary, block_size)
+    if reset_reverbs:
+        engine.reset_reverb_buses()
+    result = engine._render_span(boundary, end - boundary, block_size)
+    result.output_mode = "recomputed" if reset_reverbs else "history"
+    result.source_boundary = boundary
+    result.source_interval = {"start": start, "end": end}
+    result.source_version = candidate
+    result.tail_source = "discarded" if reset_reverbs else "preserved"
+    return result
+
+
+def adopt_panel_revision(recording: MotionRecording, panel_name: str,
+                         candidate: str, start=None, end=None):
+    """Persist a user explicit partial candidate choice."""
+    if recording.scene is None:
+        raise ValueError("recording has no room scene")
+    panel = _find_panel(recording.scene, panel_name)
+    return panel.select_revision(candidate, start, end)
+
+
+def withdraw_panel_revision(recording: MotionRecording, panel_name: str,
+                            candidate: str = None, start=None, end=None):
+    """Withdraw a choice without deleting the source candidate."""
+    if recording.scene is None:
+        raise ValueError("recording has no room scene")
+    panel = _find_panel(recording.scene, panel_name)
+    panel.unselect_revision(candidate, start, end)
+    return {
+        "panel": panel_name,
+        "remaining_conflicts": panel.remaining_conflicts(recording.duration),
+    }
+
+
+def remaining_panel_conflicts(recording: MotionRecording, scene=None):
+    """Return unresolved overlapping candidate spans for every panel."""
+    used_scene = scene if scene is not None else recording.scene
+    if used_scene is None:
+        return []
+    out = []
+    for panel in used_scene.panels:
+        conflicts = panel.remaining_conflicts(recording.duration)
+        if conflicts:
+            out.append({"panel": panel.name, "conflicts": conflicts})
+    return out
+
+
 def panel_version_manifest(recording: MotionRecording, start=0.0, end=None,
                            scene=None):
     """Run-length panel-version trace for every sample in a render span.
@@ -191,16 +276,23 @@ def panel_version_manifest(recording: MotionRecording, start=0.0, end=None,
     }
     for panel in used_scene.panels:
         versions = panel.version_at(times)
+        candidates = panel.candidates_at(times)
+        decisions = panel.decision_names_at(times)
         positions, headings = panel.pose_at(times)
         gains = panel.band_gains_at(times)
         segments = []
         k = 0
         while k < n:
             j = k + 1
-            while j < n and versions[j] == versions[k]:
+            while (j < n and versions[j] == versions[k]
+                   and list(candidates[j]) == list(candidates[k])
+                   and decisions[j] == decisions[k]):
                 j += 1
             segment = {
                 "version": str(versions[k]),
+                "candidate_versions": [str(v) for v in candidates[k]],
+                "decision": None if decisions[k] is None else str(decisions[k]),
+                "unresolved_conflict": len(candidates[k]) > 1 and decisions[k] is None,
                 "sample_start": k,
                 "sample_end": j,
                 "time_start": float(times[k]),
@@ -212,7 +304,15 @@ def panel_version_manifest(recording: MotionRecording, start=0.0, end=None,
                 segment["band_gains"] = [float(v) for v in gains[k]]
             segments.append(segment)
             k = j
-        manifest["panels"].append({"name": panel.name, "segments": segments})
+        manifest["panels"].append({
+            "name": panel.name,
+            "segments": segments,
+            "remaining_conflicts": panel.remaining_conflicts(end),
+            "decisions": [
+                {"start": float(a), "end": float(b), "revision": str(name)}
+                for a, b, name in panel.decisions
+            ],
+        })
     return manifest
 
 
