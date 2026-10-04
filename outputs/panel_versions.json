@@ -1,0 +1,157 @@
+{
+  "moving_panel": {
+    "zone": {
+      "name": "panel",
+      "min": [
+        2.8,
+        -0.6,
+        -1.2
+      ],
+      "max": [
+        3.2,
+        0.6,
+        1.2
+      ],
+      "gain": 0.4,
+      "muffle": 0.3,
+      "bands": [
+        [
+          [
+            0.0,
+            0.95
+          ]
+        ],
+        [
+          [
+            0.0,
+            0.4
+          ]
+        ],
+        [
+          [
+            0.0,
+            0.05
+          ]
+        ]
+      ],
+      "motion": [
+        [
+          0.0,
+          [
+            3.0,
+            0.0,
+            0.0
+          ],
+          0.0
+        ],
+        [
+          3.0,
+          [
+            3.0,
+            0.0,
+            0.0
+          ],
+          0.0
+        ],
+        [
+          4.0,
+          [
+            3.0,
+            3.0,
+            0.0
+          ],
+          0.0
+        ]
+      ]
+    },
+    "version_segments": [
+      {
+        "start": 0.0,
+        "end": 7.0,
+        "version": "base"
+      }
+    ],
+    "path_trace": [
+      {
+        "time": 1.0,
+        "listener_room": "a",
+        "source_room": "b",
+        "portals": [
+          {
+            "name": "ab",
+            "open": 1.0
+          }
+        ],
+        "zones": [
+          {
+            "name": "panel",
+            "gain": 0.4,
+            "version": "base",
+            "bands": [
+              0.95,
+              0.4,
+              0.05
+            ]
+          }
+        ],
+        "path_gain": 1.0,
+        "band_gains": [
+          0.95,
+          0.4,
+          0.05
+        ]
+      },
+      {
+        "time": 3.5,
+        "listener_room": "a",
+        "source_room": "b",
+        "portals": [
+          {
+            "name": "ab",
+            "open": 1.0
+          }
+        ],
+        "zones": [],
+        "path_gain": 1.0,
+        "band_gains": null
+      },
+      {
+        "time": 5.0,
+        "listener_room": "a",
+        "source_room": "b",
+        "portals": [
+          {
+            "name": "ab",
+            "open": 1.0
+          }
+        ],
+        "zones": [],
+        "path_gain": 1.0,
+        "band_gains": null
+      }
+    ]
+  },
+  "keep_history": {
+    "version_segments": [
+      {
+        "start": 0.0,
+        "end": 2.0,
+        "version": "base"
+      },
+      {
+        "start": 2.0,
+        "end": 7.0,
+        "version": "clear"
+      }
+    ]
+  },
+  "recompute_from_boundary": {
+    "version_segments": [
+      {
+        "start": 0.0,
+        "end": 7.0,
+        "version": "clear"
+      }
+    ]
+  }
+}

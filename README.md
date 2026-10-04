@@ -23,6 +23,12 @@
    可用 bands=[...] 按频带给出作用程度（每频带一个增益，或 [(t, v), ...]
    关键帧随时间 smoothstep 变化，即可在重放途中更换材料），频带划分由
    RoomScene(band_edges=...) 决定（默认 1 kHz 单分频，低/高两个频带）。
+   面板可随时间移动：motion=PanelMotion([(t, center, yaw), ...]) 让面板
+   位置与朝向（绕 z 轴转角）按关键帧 smoothstep 插值连续变化，路径是否
+   穿过面板按每个采样时刻的位姿判定。面板还可修订：
+   zone.revise(t0, t1, bands=/gain=/muffle=/motion=) 记录一个只对
+   [t0, t1) 传播区间生效的新版本，区间外仍用基础版本；修订在
+   RoomScene.to_dict/from_dict 中随场景一起序列化。
 
 ## 关键保证
 
@@ -57,6 +63,16 @@
   使用新材料。RoomScene.explain_path(listener, source, t) 返回某收听
   时刻的最强传播路径：经过的门及开度、穿过的吸声区域及其当时的
   逐频带增益。未指定 bands 的区域仍按原宽频 gain/muffle 工作。
+- 移动面板与旧尾音：频带加权施加在进入混响总线的发送端，因此面板移出
+  某条路径后，正在衰减的尾音仍保持其产生时的面板版本（不会被清空或
+  重算），只有新产生的声音使用移动后的面板；不穿过的路径（如绕行
+  路径）逐采样不受影响。
+- 区间修订与两种听感对比：revise(t0, t1, ...) 只影响该区间内产生的
+  声音，跨越边界的尾音保持历史版本（保持历史）；若把同一修订记录为
+  从 t=0 生效（revise(0, t1, ...)），历史会按新版本重算，边界处衰减
+  中的尾音也换用新材料（从边界重算），两种输出可直接对比。
+  zone.version_segments(t0, t1) 报告每个时间段使用的面板版本，
+  explain_path 的每个区域条目也带有 version 字段。
 - 一次记录、多种重放：MotionRecording 保存轨迹/音调/开关事件与房间方案；
   render_recording(..., scene=...) 或 recording.with_scene(scene) 可用
   同一行走记录重放不同的门安排或加吸声区域的方案。
@@ -99,6 +115,14 @@
   band_room2_swap.wav / band_check.png — 频带化吸声对比：同一行走记录，
   原墙面、低通透/高频吸收面板、以及 t=5 s 中途更换材料三种方案，
   图中按 1 kHz 分频分别对比低/高频带能量。
+- outputs/panel_moving.wav — 移动面板：低/中/高三个音（200 Hz / 1 kHz /
+  4 kHz，三频带场景），面板在 t=3–4 s 滑出直达路径，2.5 s 停止的
+  尾音仍保持被吸收时的频谱。
+- outputs/panel_revise_keep_history.wav / panel_revise_recompute.wav —
+  区间修订对比：高频材料在 [2 s, 结束) 被修订为通透；前者跨越边界的
+  尾音保持历史版本，后者从边界重算（尾音换用新材料）。
+- outputs/panel_versions.json / panel_check.png — 每段使用的面板版本
+  报告（含路径追踪）与三频带 RMS 对比图。
 
 测试：
 

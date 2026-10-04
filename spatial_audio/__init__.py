@@ -21,7 +21,14 @@ from .recording import (
     render_recording,
     save_checkpoint,
 )
-from .rooms import AbsorptionZone, DoorMotion, Portal, Room, RoomScene
+from .rooms import (
+    AbsorptionZone,
+    DoorMotion,
+    PanelMotion,
+    Portal,
+    Room,
+    RoomScene,
+)
 
 __all__ = [
     "SoundResource",
@@ -40,4 +47,5 @@ __all__ = [
     "Room",
     "RoomScene",
     "AbsorptionZone",
+    "PanelMotion",
 ]

@@ -401,6 +401,7 @@ def demo_corridor():
     def level(samples, t0, t1):
         seg = samples[int(t0 * SR):int(t1 * SR)]
         return float(np.sqrt(np.mean(seg ** 2)))
+
     assert level(result.samples, 2.5, 3.5) > 1e-3
     assert level(result.samples, 6.6, 7.0) > 1e-5
     assert level(result.samples, 7.5, 8.0) < 0.01 * level(result.samples, 6.6, 7.0)
@@ -506,7 +507,189 @@ def demo_bands():
     print("band absorption checks passed.")
 
 
+
+
+def _band_split3(samples, edges=(400.0, 2000.0)):
+    """Analysis helper: complementary one-pole split into three bands."""
+    from scipy.signal import lfilter
+    bands = []
+    rest = samples
+    for edge in edges:
+        a0 = 1.0 - np.exp(-2.0 * np.pi * edge / SR)
+        low = np.empty_like(samples)
+        for ch in range(2):
+            low[:, ch] = lfilter([a0], [1.0, -(1.0 - a0)], rest[:, ch])
+        bands.append(low)
+        rest = rest - low
+    bands.append(rest)
+    return bands
+
+
+def _panel_scene(zones):
+    """Listener room a, source room b, detour room c (a-c-b); three bands."""
+    rooms = [
+        Room("a", (-5.0, -5.0, -2.0), (0.0, 5.0, 2.0), reverb_time=0.8),
+        Room("b", (0.0, -5.0, -2.0), (5.0, 5.0, 2.0), reverb_time=0.8),
+        Room("c", (-5.0, 5.0, -2.0), (5.0, 10.0, 2.0), reverb_time=0.8),
+    ]
+    portals = [
+        Portal("ab", "a", "b", DoorMotion([(0.0, 1.0)]),
+               position=(0.0, 0.0, 0.0)),
+        Portal("ac", "a", "c", DoorMotion([(0.0, 1.0)]),
+               position=(-2.0, 5.0, 0.0)),
+        Portal("cb", "c", "b", DoorMotion([(0.0, 1.0)]),
+               position=(4.0, 5.0, 0.0)),
+    ]
+    return RoomScene(rooms, portals, zones, band_edges=(400.0, 2000.0))
+
+
+def _panel_recording(duration, events):
+    rec = MotionRecording(duration, SR,
+                          listener_forward=(1.0, 0.0, 0.0), emitters=[])
+    rec.emitters = [
+        EmitterSpec(name=f"tone_{int(f)}", kind="tone",
+                    params={"frequency": f, "duration": duration,
+                            "fade": 0.01},
+                    trajectory=Trajectory.linear(
+                        [(0.0, (4.0, 0.0, 0.0)),
+                         (duration, (4.0, 0.0, 0.0))]),
+                    events=list(events))
+        for f in (200.0, 1000.0, 4000.0)
+    ]
+    return rec
+
+
+def demo_panels():
+    """Moving + revisable panels: keep-history vs recompute comparison."""
+    import json
+
+    duration = 7.0
+    # Panel on the direct path (and the reverb send) that slides away
+    # between t=3 and t=4; the detour path never crosses it.
+    move_keys = [(0.0, (3.0, 0.0, 0.0), 0.0),
+                 (3.0, (3.0, 0.0, 0.0), 0.0),
+                 (4.0, (3.0, 3.0, 0.0), 0.0)]
+    base_bands = [0.95, 0.4, 0.05]
+
+    # 1) Moving panel: sources stop at 2.5 s, the tail keeps the absorbed
+    #    spectrum even after the panel leaves the path.
+    moving = AbsorptionZone("panel", (2.8, -0.6, -1.2), (3.2, 0.6, 1.2),
+                            bands=base_bands, motion=move_keys)
+    rec_stop = _panel_recording(duration, [(2.5, False)])
+    rec_stop.scene = _panel_scene([moving])
+    out_moving = render_recording(rec_stop, block_size=1024)
+    sf.write(OUT / "panel_moving.wav", out_moving.samples, SR,
+             subtype="PCM_16")
+
+    # 2) Revision comparison: high band absorbed at base, revised to clear
+    #    for propagation times in [2, 7). Sources pause 1.5-2.5 s so a
+    #    tail decays across the revision boundary.
+    events = [(1.5, False), (2.5, True)]
+    keep_zone = AbsorptionZone("panel", (2.8, -0.6, -1.2), (3.2, 0.6, 1.2),
+                               bands=base_bands)
+    keep_zone.revise(2.0, duration, label="clear",
+                     bands=[0.95, 0.7, 0.9])
+    rec_keep = _panel_recording(duration, events)
+    rec_keep.scene = _panel_scene([keep_zone])
+    out_keep = render_recording(rec_keep, block_size=1024)
+    sf.write(OUT / "panel_revise_keep_history.wav", out_keep.samples, SR,
+             subtype="PCM_16")
+
+    redo_zone = AbsorptionZone("panel", (2.8, -0.6, -1.2), (3.2, 0.6, 1.2),
+                               bands=base_bands)
+    # Recompute from the boundary: the revision reaches back to t=0, so
+    # the tail ringing at the boundary is regenerated with the revised
+    # material instead of keeping the historical one.
+    redo_zone.revise(0.0, duration, label="clear",
+                     bands=[0.95, 0.7, 0.9])
+    rec_redo = _panel_recording(duration, events)
+    rec_redo.scene = _panel_scene([redo_zone])
+    out_redo = render_recording(rec_redo, block_size=1024)
+    sf.write(OUT / "panel_revise_recompute.wav", out_redo.samples, SR,
+             subtype="PCM_16")
+
+    # Per-segment panel version report for both scenes.
+    report = {
+        "moving_panel": {
+            "zone": moving.to_dict(),
+            "version_segments": [
+                {"start": s, "end": e, "version": v}
+                for s, e, v in moving.version_segments(0.0, duration)
+            ],
+            "path_trace": [
+                rec_stop.scene.explain_path((-2.0, 0.0, 0.0),
+                                            (4.0, 0.0, 0.0), t)
+                for t in (1.0, 3.5, 5.0)
+            ],
+        },
+        "keep_history": {
+            "version_segments": [
+                {"start": s, "end": e, "version": v}
+                for s, e, v in keep_zone.version_segments(0.0, duration)
+            ],
+        },
+        "recompute_from_boundary": {
+            "version_segments": [
+                {"start": s, "end": e, "version": v}
+                for s, e, v in redo_zone.version_segments(0.0, duration)
+            ],
+        },
+    }
+    with open(OUT / "panel_versions.json", "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+
+    # Band-energy comparison plot.
+    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+    names = ["low (<400 Hz)", "mid (0.4-2 kHz)", "high (>2 kHz)"]
+    for bi, ax in enumerate(axes):
+        for label, res, style in [
+            ("moving panel", out_moving, "-"),
+            ("revise: keep history", out_keep, "--"),
+            ("revise: recompute", out_redo, ":"),
+        ]:
+            band = _band_split3(res.samples)[bi]
+            t, rms = channel_rms(band)
+            ax.plot(t, rms[:, 0], style, label=label)
+        ax.set_ylabel("RMS level")
+        ax.set_title(f"{names[bi]} band")
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8)
+    axes[-1].set_xlabel("time (s)")
+    fig.tight_layout()
+    fig.savefig(OUT / "panel_check.png", dpi=130)
+
+    def level(samples, t0, t1):
+        seg = samples[int(t0 * SR):int(t1 * SR)]
+        return float(np.sqrt(np.mean(seg ** 2)))
+
+    def tone_energy(samples, t0, t1, freq):
+        seg = samples[int(t0 * SR):int(t1 * SR), 0]
+        spec = np.abs(np.fft.rfft(seg * np.hanning(len(seg)))) ** 2
+        freqs = np.fft.rfftfreq(len(seg), 1.0 / SR)
+        k = int(np.argmin(np.abs(freqs - freq)))
+        return float(spec[max(0, k - 3):k + 4].sum())
+
+    # The tail after the panel moved away is still the absorbed one.
+    static_zone = AbsorptionZone("panel", (2.8, -0.6, -1.2), (3.2, 0.6, 1.2),
+                                 bands=base_bands)
+    rec_static = _panel_recording(duration, [(2.5, False)])
+    rec_static.scene = _panel_scene([static_zone])
+    out_static = render_recording(rec_static, block_size=1024)
+    tail_moving = level(out_moving.samples, 3.5, 5.5)
+    tail_static = level(out_static.samples, 3.5, 5.5)
+    assert abs(tail_moving - tail_static) < 1e-6 * max(tail_static, 1e-9)
+    # Recomputed tail carries the revised (clear) high band: the 4 kHz
+    # content of the tail decaying across the boundary is much stronger.
+    e_keep = tone_energy(out_keep.samples, 1.8, 2.4, 4000.0)
+    e_redo = tone_energy(out_redo.samples, 1.8, 2.4, 4000.0)
+    assert e_redo > 2.0 * e_keep
+    print("wrote panel_moving.wav, panel_revise_*.wav, "
+          "panel_versions.json, panel_check.png")
+    print("panel checks passed.")
+
+
 if __name__ == "__main__":
     main()
     demo_corridor()
     demo_bands()
+    demo_panels()
