@@ -6,8 +6,8 @@ replaying reconstructs the exact scene so the exported audio is reproducible.
 
 from __future__ import annotations
 
-import json
 import copy
+import json
 from dataclasses import dataclass
 from typing import Optional
 
@@ -170,7 +170,7 @@ def render_recording(recording: MotionRecording, block_size: int = 1024,
 
 
 def panel_version_manifest(recording: MotionRecording, start=0.0, end=None,
-                           scene=None):
+                           scene=None, preview=None):
     """Run-length panel-version trace for every sample in a render span.
 
     Each segment names the panel version actually used at those sample
@@ -179,6 +179,18 @@ def panel_version_manifest(recording: MotionRecording, start=0.0, end=None,
     render auditable without inferring geometry from the output audio.
     """
     used_scene = scene if scene is not None else recording.scene
+    if preview is not None:
+        used_scene = copy.deepcopy(used_scene)
+        panel_name, candidate_name = preview[0], preview[1]
+        preview_start = preview[2] if len(preview) > 2 else None
+        preview_end = preview[3] if len(preview) > 3 else None
+        panel_index = next(
+            i for i, panel in enumerate(used_scene.panels)
+            if panel.name == panel_name
+        )
+        used_scene.panels[panel_index] = used_scene.panels[panel_index].preview_revision(
+            candidate_name, preview_start, preview_end
+        )
     sr = recording.sample_rate
     start = float(start)
     end = float(recording.duration if end is None else end)
@@ -239,15 +251,31 @@ def render_panel_candidate(recording: MotionRecording, panel_name: str,
     boundary-recomputed comparison output.
     """
     scene = copy.deepcopy(recording.scene)
-    panel = next(p for p in scene.panels if p.name == panel_name)
-    panel.adopt_revision(candidate_name, start, end)
+    panel_index = next(
+        i for i, panel in enumerate(scene.panels)
+        if panel.name == panel_name
+    )
+    panel = scene.panels[panel_index]
+    scene.panels[panel_index] = panel.preview_revision(
+        candidate_name, start, end
+    )
     engine = build_engine(recording, scene=scene)
     if recompute_from is None:
         return engine.render(recording.duration, block_size=block_size)
-    duration = recording.duration - float(recompute_from)
-    return engine.render_recomputed_from(
-        recompute_from, duration, block_size=block_size,
+    boundary = float(recompute_from)
+    preview_panel = scene.panels[panel_index]
+    override = preview_panel.preview_override
+    preview_panel.preview_override = None
+    if boundary > 0.0:
+        engine._render_span(0.0, boundary, block_size)
+    engine.reset_reverb_buses()
+    preview_panel.preview_override = override
+    duration = recording.duration - boundary
+    result = engine._render_span(
+        boundary, duration, block_size, output_mode="recomputed",
     )
+    engine._clock = boundary + duration
+    return result
 
 
 def save_checkpoint(recording: MotionRecording, engine: SpatialEngine, path):

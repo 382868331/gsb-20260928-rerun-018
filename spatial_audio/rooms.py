@@ -367,6 +367,7 @@ class Panel:
         ]
         self.revisions = list(revisions)
         self.decisions = [dict(d) for d in decisions]
+        self.preview_override = None
 
     def revision(self, name):
         if name == "base":
@@ -477,7 +478,24 @@ class Panel:
     def preview_revision(self, name, start=None, end=None):
         """Return an independent panel copy for A/B candidate auditioning."""
         panel = copy.deepcopy(self)
-        panel.adopt_revision(name, start, end)
+        revision = None if name == "base" else panel.revision(name)
+        if revision is None:
+            if start is None or end is None:
+                raise ValueError("start and end are required to preview base")
+            preview_start, preview_end = float(start), float(end)
+        else:
+            if start is None or end is None:
+                preview_start, preview_end = revision.start, revision.end
+            else:
+                preview_start = max(float(start), revision.start)
+                preview_end = min(float(end), revision.end)
+        if not preview_start < preview_end:
+            raise ValueError("preview range needs start < end")
+        panel.preview_override = {
+            "revision": str(name),
+            "start": preview_start,
+            "end": preview_end,
+        }
         return panel
 
     def _covering_revisions(self, tv):
@@ -521,7 +539,23 @@ class Panel:
             decided |= valid
             status[valid] = "adopted-base" if name == "base" else "adopted"
 
-        unresolved = ~decided
+        preview_mask = np.zeros(n, dtype=bool)
+        if self.preview_override is not None:
+            preview = self.preview_override
+            preview_name = preview["revision"]
+            preview_mask = (tv >= preview["start"]) & (tv < preview["end"])
+            if preview_name == "base":
+                selected[preview_mask] = -1
+            else:
+                preview_index = revision_by_name.get(preview_name)
+                if preview_index is not None:
+                    preview_mask &= covering[preview_index]
+                    selected[preview_mask] = preview_index
+            status[preview_mask] = (
+                "preview-base" if preview_name == "base" else "preview"
+            )
+
+        unresolved = ~decided & ~preview_mask
         counts = np.array([len(v) for v in candidate_index_lists])
         lone = unresolved & (counts == 1)
         conflict = unresolved & (counts > 1)

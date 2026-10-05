@@ -308,6 +308,94 @@ def test_later_candidate_cannot_replace_previous_partial_decision():
     assert versions[0] == "editor_left" and statuses[0] == "conflict"
 
 
+def test_preview_temporarily_overrides_adoption_without_saving_it(tmp_path):
+    rec = _conflict_recording()
+    panel = rec.scene.panels[0]
+    panel.adopt_revision("editor_left", 1.0, 1.5)
+
+    final_before = render_recording(rec, block_size=257).samples
+    right_preview = render_panel_candidate(
+        rec, "mover", "editor_right", start=1.1, end=1.4, block_size=37,
+    ).samples
+
+    assert panel.decisions == [
+        {"revision": "editor_left", "start": 1.0, "end": 1.5},
+    ]
+    assert _rms(right_preview, 1.15, 1.35) > (
+        1.4 * _rms(final_before, 1.15, 1.35)
+    )
+    np.testing.assert_allclose(
+        right_preview[int(1.01 * SR):int(1.08 * SR)],
+        final_before[int(1.01 * SR):int(1.08 * SR)], atol=1e-12,
+    )
+    preview_manifest = panel_version_manifest(
+        rec, start=1.02, end=1.32,
+        preview=("mover", "editor_right", 1.1, 1.4),
+    )["panels"][0]["segments"]
+    by_time = {round(s["time_start"], 3): s for s in preview_manifest}
+    assert by_time[1.020]["version"] == "editor_left"
+    assert by_time[1.020]["status"] == "adopted"
+    assert by_time[1.100]["version"] == "editor_right"
+    assert by_time[1.100]["status"] == "preview"
+
+    panel.reselect_revision("editor_left", "editor_right", 1.1, 1.2)
+    panel.withdraw_revision("editor_right", 1.14, 1.17)
+    expected_decisions = [
+        {"revision": "editor_left", "start": 1.0, "end": 1.1},
+        {"revision": "editor_left", "start": 1.2, "end": 1.5},
+        {"revision": "editor_right", "start": 1.1, "end": 1.14},
+        {"revision": "editor_right", "start": 1.17, "end": 1.2},
+    ]
+    assert panel.decisions == expected_decisions
+
+    path = tmp_path / "partial-panel.json"
+    rec.save(path)
+    loaded = MotionRecording.load(path)
+    loaded_panel = loaded.scene.panels[0]
+    assert loaded_panel.decisions == expected_decisions
+
+    times = np.array([1.05, 1.12, 1.15, 1.18, 1.3, 1.7])
+    versions, statuses, candidates = loaded_panel.selection_report_at(times)
+    assert list(versions) == [
+        "editor_left", "editor_right", "editor_left",
+        "editor_right", "editor_left", "editor_left",
+    ]
+    assert list(statuses) == [
+        "adopted", "adopted", "conflict",
+        "adopted", "adopted", "conflict",
+    ]
+    assert candidates[2] == ["editor_left", "editor_right"]
+    assert loaded_panel.remaining_conflicts() == [
+        {"start": 0.8, "end": 1.0,
+         "candidates": ["editor_left", "editor_right"]},
+        {"start": 1.14, "end": 1.17,
+         "candidates": ["editor_left", "editor_right"]},
+        {"start": 1.5, "end": 2.0,
+         "candidates": ["editor_left", "editor_right"]},
+    ]
+
+    full = render_recording(loaded, block_size=1024).samples
+    for block_size in (37, 513):
+        np.testing.assert_allclose(
+            render_recording(loaded, block_size=block_size).samples,
+            full, atol=1e-11,
+        )
+
+    preview_renders = [
+        render_panel_candidate(
+            loaded, "mover", "editor_right",
+            start=1.1, end=1.2, block_size=block_size,
+        ).samples
+        for block_size in (64, 37, 1023)
+    ]
+    for samples in preview_renders[1:]:
+        np.testing.assert_allclose(samples, preview_renders[0], atol=1e-11)
+    assert _rms(preview_renders[0], 1.145, 1.165) > (
+        1.4 * _rms(full, 1.145, 1.165)
+    )
+    assert loaded_panel.decisions == expected_decisions
+
+
 def test_pending_candidates_round_trip_and_history_recompute_are_marked(tmp_path):
     duration = 1.1
     rec = _conflict_recording()
