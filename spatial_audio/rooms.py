@@ -367,6 +367,7 @@ class Panel:
         ]
         self.revisions = list(revisions)
         self.decisions = [dict(d) for d in decisions]
+        self.preview_decisions = []
 
     def revision(self, name):
         if name == "base":
@@ -423,21 +424,25 @@ class Panel:
     def remaining_conflicts(self, duration=None):
         return self.overlapping_candidates(0.0, duration)
 
-    def adopt_revision(self, name, start=None, end=None):
-        """Explicitly choose base or a candidate on a (sub)interval."""
+    def _resolved_decision_range(self, name, start=None, end=None):
         revision = None if name == "base" else self.revision(name)
         if start is None or end is None:
             if revision is None:
-                raise ValueError("start and end are required to adopt base")
+                raise ValueError("start and end are required to select base")
             start, end = revision.start, revision.end
         start, end = float(start), float(end)
         if not start < end:
-            raise ValueError("adoption needs start < end")
+            raise ValueError("selection needs start < end")
         if revision is not None:
             start = max(start, revision.start)
             end = min(end, revision.end)
             if not start < end:
                 raise ValueError("selected range does not overlap the candidate")
+        return start, end
+
+    def adopt_revision(self, name, start=None, end=None):
+        """Explicitly choose base or a candidate on a (sub)interval."""
+        start, end = self._resolved_decision_range(name, start, end)
         self.decisions.append({
             "revision": str(name), "start": start, "end": end,
         })
@@ -477,7 +482,10 @@ class Panel:
     def preview_revision(self, name, start=None, end=None):
         """Return an independent panel copy for A/B candidate auditioning."""
         panel = copy.deepcopy(self)
-        panel.adopt_revision(name, start, end)
+        start, end = panel._resolved_decision_range(name, start, end)
+        panel.preview_decisions = [{
+            "revision": str(name), "start": start, "end": end,
+        }]
         return panel
 
     def _covering_revisions(self, tv):
@@ -508,8 +516,14 @@ class Panel:
 
         decided = np.zeros(n, dtype=bool)
         revision_by_name = {r.name: k for k, r in enumerate(self.revisions)}
-        for decision in self.decisions:
-            mask = (~decided) & (tv >= decision["start"]) & (tv < decision["end"])
+        all_decisions = [
+            (decision, "adopted") for decision in self.decisions
+        ] + [
+            (decision, "preview") for decision in self.preview_decisions
+        ]
+        for decision, decision_status in all_decisions:
+            in_range = (tv >= decision["start"]) & (tv < decision["end"])
+            mask = in_range if decision_status == "preview" else (~decided) & in_range
             name = decision["revision"]
             if name == "base":
                 valid = mask
@@ -519,7 +533,10 @@ class Panel:
                 valid = np.zeros(n, dtype=bool) if k is None else mask & covering[k]
                 selected[valid] = k
             decided |= valid
-            status[valid] = "adopted-base" if name == "base" else "adopted"
+            if decision_status == "preview":
+                status[valid] = "preview-base" if name == "base" else "preview"
+            else:
+                status[valid] = "adopted-base" if name == "base" else "adopted"
 
         unresolved = ~decided
         counts = np.array([len(v) for v in candidate_index_lists])

@@ -240,7 +240,8 @@ def render_panel_candidate(recording: MotionRecording, panel_name: str,
     """
     scene = copy.deepcopy(recording.scene)
     panel = next(p for p in scene.panels if p.name == panel_name)
-    panel.adopt_revision(candidate_name, start, end)
+    preview_panel = panel.preview_revision(candidate_name, start, end)
+    scene.panels[scene.panels.index(panel)] = preview_panel
     engine = build_engine(recording, scene=scene)
     if recompute_from is None:
         return engine.render(recording.duration, block_size=block_size)

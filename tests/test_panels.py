@@ -308,6 +308,99 @@ def test_later_candidate_cannot_replace_previous_partial_decision():
     assert versions[0] == "editor_left" and statuses[0] == "conflict"
 
 
+def test_partial_preview_is_transient_and_round_trip_workflow_stays_consistent(tmp_path):
+    rec = _conflict_recording(duration=2.2)
+    panel = rec.scene.panels[0]
+    panel.adopt_revision("editor_left", 1.0, 1.5)
+
+    formal_before = render_recording(rec, block_size=512).samples
+    preview = panel.preview_revision("editor_right", 1.2, 1.4)
+    preview_rec = MotionRecording(
+        rec.duration, rec.sample_rate, rec.listener_trajectory,
+        rec.listener_forward, rec.emitters, scene=_scene(preview),
+    )
+    preview_audio = render_recording(preview_rec, block_size=37).samples
+    api_preview = render_panel_candidate(
+        rec, "mover", "editor_right", block_size=37, start=1.2, end=1.4,
+    ).samples
+    np.testing.assert_allclose(api_preview, preview_audio, atol=1e-12)
+    preview_engine = build_engine(preview_rec)
+    preview_chunks = np.concatenate([
+        preview_engine.render_chunk(1.17, block_size=129).samples,
+        preview_engine.render_chunk(0.31, block_size=257).samples,
+        preview_engine.render_chunk(0.72, block_size=511).samples,
+    ])
+    np.testing.assert_allclose(preview_chunks, preview_audio, atol=1e-11)
+    np.testing.assert_allclose(
+        preview_audio[:int(1.1 * SR)], formal_before[:int(1.1 * SR)], atol=1e-12,
+    )
+    assert np.max(np.abs(
+        preview_audio[int(1.22 * SR):int(1.38 * SR)]
+        - formal_before[int(1.22 * SR):int(1.38 * SR)]
+    )) > 1e-8
+
+    times = np.array([0.9, 1.1, 1.3, 1.45, 1.7])
+    versions, statuses, _ = preview.selection_report_at(times)
+    assert list(versions) == [
+        "editor_left", "editor_left", "editor_right", "editor_left", "editor_left",
+    ]
+    assert list(statuses) == [
+        "conflict", "adopted", "preview", "adopted", "conflict",
+    ]
+    assert panel.decisions == [
+        {"revision": "editor_left", "start": 1.0, "end": 1.5},
+    ]
+    assert not hasattr(panel, "preview_decisions") or panel.preview_decisions == []
+    assert preview.overlapping_candidates() == panel.overlapping_candidates() == [
+        {"start": 0.8, "end": 1.0,
+         "candidates": ["editor_left", "editor_right"]},
+        {"start": 1.5, "end": 2.0,
+         "candidates": ["editor_left", "editor_right"]},
+    ]
+
+    panel.reselect_revision("editor_left", "editor_right", 1.2, 1.4)
+    panel.withdraw_revision("editor_right", 1.25, 1.35)
+    expected_decisions = [
+        {"revision": "editor_left", "start": 1.0, "end": 1.2},
+        {"revision": "editor_left", "start": 1.4, "end": 1.5},
+        {"revision": "editor_right", "start": 1.2, "end": 1.25},
+        {"revision": "editor_right", "start": 1.35, "end": 1.4},
+    ]
+    assert panel.decisions == expected_decisions
+
+    path = tmp_path / "partial-workflow.json"
+    rec.save(path)
+    reopened = MotionRecording.load(path)
+    restored = reopened.scene.panels[0]
+    assert restored.decisions == expected_decisions
+    assert restored.preview_decisions == []
+    assert restored.overlapping_candidates() == [
+        {"start": 0.8, "end": 1.0,
+         "candidates": ["editor_left", "editor_right"]},
+        {"start": 1.25, "end": 1.35,
+         "candidates": ["editor_left", "editor_right"]},
+        {"start": 1.5, "end": 2.0,
+         "candidates": ["editor_left", "editor_right"]},
+    ]
+
+    final_full = render_recording(reopened, block_size=1024).samples
+    chunk_engine = build_engine(reopened)
+    final_chunks = np.concatenate([
+        chunk_engine.render_chunk(0.83, block_size=127).samples,
+        chunk_engine.render_chunk(1.02, block_size=509).samples,
+        chunk_engine.render_chunk(0.35, block_size=2048).samples,
+    ])
+    np.testing.assert_allclose(final_chunks, final_full, atol=1e-11)
+
+    reopened_preview = restored.preview_revision("editor_right", 1.25, 1.35)
+    versions, statuses, _ = reopened_preview.selection_report_at(
+        np.array([1.22, 1.3, 1.38])
+    )
+    assert list(versions) == ["editor_right", "editor_right", "editor_right"]
+    assert list(statuses) == ["adopted", "preview", "adopted"]
+    assert restored.decisions == expected_decisions
+
+
 def test_pending_candidates_round_trip_and_history_recompute_are_marked(tmp_path):
     duration = 1.1
     rec = _conflict_recording()
